@@ -140,7 +140,7 @@ fn unborn_untracked() -> anyhow::Result<()> {
     // It's clear that this branch is unborn as there is not a single commit,
     // in absence of a target ref.
     snapbox::assert_data_eq!(
-        info.to_debug(),
+        &info.to_debug(),
         snapbox::str![[r#"
 RefInfo {
     workspace_ref_info: Some(
@@ -166,7 +166,7 @@ RefInfo {
             base: None,
             segments: [
                 ref_info::ui::Segment {
-                    id: NodeIndex(0),
+                    id: 0,
                     ref_name: "►main[🌳]",
                     remote_tracking_ref_name: "None",
                     commits: [],
@@ -195,7 +195,7 @@ RefInfo {
     // It's now possible to use the old API with unborn repos.
     // This type can't really represent missing tips, but `null()` will do.
     snapbox::assert_data_eq!(
-        stacks.to_debug(),
+        &stacks.to_debug(),
         snapbox::str![[r#"
 [
     StackEntry {
@@ -220,7 +220,7 @@ RefInfo {
     let details = stack_details_v3(stacks[0].id, &repo, &meta)?;
     // It's also possible to obtain details.
     snapbox::assert_data_eq!(
-        details.to_debug(),
+        &details.to_debug(),
         snapbox::str![[r#"
 StackDetails {
     derived_name: "main",
@@ -261,7 +261,7 @@ fn detached() -> anyhow::Result<()> {
     // As the workspace name is derived from the first segment, it's empty as well.
     // We do know that `main` is pointing at the local commit though, despite the unnamed segment owning it.
     snapbox::assert_data_eq!(
-        info.to_debug(),
+        &info.to_debug(),
         snapbox::str![[r#"
 RefInfo {
     workspace_ref_info: None,
@@ -274,7 +274,7 @@ RefInfo {
             base: None,
             segments: [
                 ref_info::ui::Segment {
-                    id: NodeIndex(0),
+                    id: 0,
                     ref_name: "None",
                     remote_tracking_ref_name: "None",
                     commits: [
@@ -305,7 +305,7 @@ RefInfo {
     let stacks = stacks_v3(&repo, &meta, StacksFilter::All, None)?;
     // Detached heads can't be represented with this API as it really needs a name.
     snapbox::assert_data_eq!(
-        stacks.to_debug(),
+        &stacks.to_debug(),
         snapbox::str![[r#"
 []
 
@@ -326,7 +326,7 @@ fn conflicted_in_local_branch() -> anyhow::Result<()> {
     let info = head_info(&repo, &meta, ref_info::Options::default())?;
     // The conflict is detected in the local commit.
     snapbox::assert_data_eq!(
-        info.to_debug(),
+        &info.to_debug(),
         snapbox::str![[r#"
 RefInfo {
     workspace_ref_info: Some(
@@ -354,7 +354,7 @@ RefInfo {
             base: None,
             segments: [
                 ref_info::ui::Segment {
-                    id: NodeIndex(0),
+                    id: 0,
                     ref_name: "►main[🌳]",
                     remote_tracking_ref_name: "None",
                     commits: [
@@ -385,7 +385,7 @@ RefInfo {
 
     let stacks = stacks_v3(&repo, &meta, StacksFilter::All, None)?;
     snapbox::assert_data_eq!(
-        stacks.to_debug(),
+        &stacks.to_debug(),
         snapbox::str![[r#"
 [
     StackEntry {
@@ -461,7 +461,7 @@ fn single_branch() -> anyhow::Result<()> {
         "a single branch, a single segment"
     );
     snapbox::assert_data_eq!(
-        info.to_debug(),
+        &info.to_debug(),
         snapbox::str![[r#"
 RefInfo {
     workspace_ref_info: Some(
@@ -489,7 +489,7 @@ RefInfo {
             base: None,
             segments: [
                 ref_info::ui::Segment {
-                    id: NodeIndex(0),
+                    id: 0,
                     ref_name: "►main[🌳]",
                     remote_tracking_ref_name: "None",
                     commits: [
@@ -528,7 +528,7 @@ RefInfo {
 
     let stacks = stacks_v3(&repo, &meta, StacksFilter::All, None)?;
     snapbox::assert_data_eq!(
-        stacks.to_debug(),
+        &stacks.to_debug(),
         snapbox::str![[r#"
 [
     StackEntry {
@@ -605,7 +605,7 @@ fn single_branch_multiple_segments() -> anyhow::Result<()> {
     let info = head_info(&repo, &meta, standard_options())?;
 
     snapbox::assert_data_eq!(
-        info.to_debug(),
+        &info.to_debug(),
         snapbox::str![[r#"
 RefInfo {
     workspace_ref_info: Some(
@@ -633,7 +633,7 @@ RefInfo {
             base: None,
             segments: [
                 ref_info::ui::Segment {
-                    id: NodeIndex(0),
+                    id: 0,
                     ref_name: "►main[🌳]",
                     remote_tracking_ref_name: "None",
                     commits: [
@@ -646,7 +646,7 @@ RefInfo {
                     base: "344e320",
                 },
                 ref_info::ui::Segment {
-                    id: NodeIndex(1),
+                    id: 1,
                     ref_name: "►nine",
                     remote_tracking_ref_name: "None",
                     commits: [
@@ -661,7 +661,7 @@ RefInfo {
                     base: "c4f2a35",
                 },
                 ref_info::ui::Segment {
-                    id: NodeIndex(2),
+                    id: 2,
                     ref_name: "►six",
                     remote_tracking_ref_name: "None",
                     commits: [
@@ -676,7 +676,7 @@ RefInfo {
                     base: "281da94",
                 },
                 ref_info::ui::Segment {
-                    id: NodeIndex(3),
+                    id: 3,
                     ref_name: "►three",
                     remote_tracking_ref_name: "None",
                     commits: [
@@ -690,7 +690,7 @@ RefInfo {
                     base: "3d57fc1",
                 },
                 ref_info::ui::Segment {
-                    id: NodeIndex(4),
+                    id: 4,
                     ref_name: "►one",
                     remote_tracking_ref_name: "None",
                     commits: [
@@ -722,7 +722,7 @@ RefInfo {
 
     let stacks = stacks_v3(&repo, &meta, StacksFilter::All, None)?;
     snapbox::assert_data_eq!(
-        stacks.to_debug(),
+        &stacks.to_debug(),
         snapbox::str![[r#"
 [
     StackEntry {

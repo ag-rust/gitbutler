@@ -13,7 +13,7 @@ pub use stack::{Stack, StackCommit, StackCommitDebugFlags, StackCommitFlags, Sta
 
 #[expect(clippy::module_inception)]
 pub(crate) mod workspace;
-pub use workspace::{TargetCommit, TargetRef, WorkspaceKind};
+pub use workspace::{TargetCommit, TargetRef, WorkspaceKind, api::StackTip};
 
 #[cfg(feature = "legacy")]
 pub use workspace::api::HeadStatus;

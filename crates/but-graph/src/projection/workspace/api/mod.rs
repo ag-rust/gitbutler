@@ -1,13 +1,13 @@
 use std::borrow::Cow;
 
+use crate::Direction;
 use anyhow::Context;
 use bstr::BStr;
 use but_core::{RefMetadata, extract_remote_name_and_short_name, ref_metadata::StackId};
-use petgraph::Direction;
 use tracing::instrument;
 
 use crate::{
-    CommitFlags, CommitIndex, Graph, Segment, SegmentIndex, Workspace,
+    CommitFlags, CommitIndex, Graph, Segment, Workspace,
     workspace::{
         Stack, StackCommit, StackSegment, TargetRef, WorkspaceKind,
         workspace::find_segment_owner_indexes_by_refname,
@@ -18,6 +18,7 @@ use crate::{
 pub type CommitOwnerIndexes = (usize, usize, CommitIndex);
 
 mod queries;
+pub use queries::StackTip;
 #[cfg(feature = "legacy")]
 pub use queries::legacy::HeadStatus;
 
@@ -42,9 +43,77 @@ impl Workspace {
         meta: &impl RefMetadata,
         project_meta: but_core::ref_metadata::ProjectMeta,
     ) -> anyhow::Result<()> {
-        let graph = Graph::from_head(repo, meta, project_meta, self.graph.options.clone())?;
-        *self = graph.into_workspace()?;
+        *self = Workspace::from_head(repo, meta, project_meta, self.graph.options.clone())?;
         Ok(())
+    }
+
+    /// Refresh this instance by projecting `commit_graph` directly — typically the rebase
+    /// editor's mutated arena, which IS the next workspace, so no repository rewalk is
+    /// needed. (Mutate-then-project == rewalk-then-project was proven suite-wide on a
+    /// field-exact projection fingerprint before the rewalk retired.)
+    ///
+    /// Falls back to a rewalk when the commit graph has nothing to project: HEAD is unborn
+    /// (e.g. its referent was deleted without a repoint) or points outside the graph.
+    #[instrument(
+        name = "Workspace::refresh_from_commit_graph",
+        level = "debug",
+        skip_all,
+        err(Debug)
+    )]
+    pub fn refresh_from_commit_graph(
+        &mut self,
+        commit_graph: crate::CommitGraph,
+        repo: &gix::Repository,
+        meta: &impl RefMetadata,
+    ) -> anyhow::Result<()> {
+        let project_meta = self.graph.project_meta.clone();
+        let options = self.graph.options.clone();
+        let Some(mutated) = crate::workspace_from_commit_graph(
+            commit_graph,
+            repo,
+            meta,
+            project_meta.clone(),
+            options,
+            crate::walk::Overlay::default(),
+        )?
+        else {
+            return self.refresh_from_head(repo, meta, project_meta);
+        };
+        *self = mutated;
+        Ok(())
+    }
+
+    /// Preview `commit_graph` — typically a not-yet-materialized rebase's mutated arena, which
+    /// already IS the next workspace state — with the rebase's pending ref edits and entrypoint
+    /// served from `overlay`; no repository rewalk. The materialized twin is
+    /// [`Self::refresh_from_commit_graph`].
+    ///
+    /// Falls back to an overlay rewalk ([`Self::redo`]) when the commit graph has nothing to
+    /// project: the entrypoint is unborn or points outside the graph.
+    #[instrument(
+        name = "Workspace::preview_from_commit_graph",
+        level = "debug",
+        skip_all,
+        err(Debug)
+    )]
+    pub fn preview_from_commit_graph(
+        &self,
+        commit_graph: crate::CommitGraph,
+        repo: &gix::Repository,
+        meta: &impl RefMetadata,
+        overlay: crate::walk::Overlay,
+    ) -> anyhow::Result<Self> {
+        match crate::workspace_from_commit_graph(
+            commit_graph,
+            repo,
+            meta,
+            self.graph.project_meta.clone(),
+            self.graph.options.clone(),
+            overlay.clone(),
+        )? {
+            Some(preview) => Ok(preview),
+            None => self.redo(repo, meta, overlay),
+        }
     }
 }
 
@@ -60,11 +129,6 @@ impl Workspace {
     /// Note that for managed workspaces, this can be retrieved via [`WorkspaceKind::Managed`].
     pub fn ref_name(&self) -> Option<&gix::refs::FullNameRef> {
         self.graph[self.id].ref_name()
-    }
-
-    /// Like [Self::ref_name()], but returns reference and worktree information instead.
-    pub fn ref_info(&self) -> Option<&crate::RefInfo> {
-        self.graph[self.id].ref_info.as_ref()
     }
 
     /// Like [`Self::ref_name()`], but return a generic `<anonymous>` name for unnamed workspaces.
@@ -103,7 +167,7 @@ impl Workspace {
     ///
     /// Prefers the stored [`Self::target_commit`] (the last-synced target SHA),
     /// falling back to the tip of [`Self::target_ref`] (the remote tracking branch).
-    /// Does not consider additional traversal tips.
+    /// Does not consider additional traversal seeds.
     ///
     /// Use [`Self::stored_target_commit_id()`] instead when callers need only the explicit
     /// stored target commit without falling back to the target ref tip.
@@ -118,7 +182,8 @@ impl Workspace {
     }
 
     /// Return the `(merge-base, target-commit-id)` of the merge-base between the `commit_to_merge`
-    /// and the effective target side, see [Self::effective_target_segment_index()].
+    /// and the effective target side (target ref, then stored target commit, then the first
+    /// integrated traversal tip).
     /// Return `None` when none of these is set, or if there was no merge-base.
     ///
     /// Use this to get the merge-base for test-merges between `commit_to_merge` and the target,
@@ -128,7 +193,7 @@ impl Workspace {
         commit_to_merge: impl Into<gix::ObjectId>,
     ) -> Option<(gix::ObjectId, gix::ObjectId)> {
         let commit_to_merge = commit_to_merge.into();
-        let commit_segment_index = self.graph.node_weights().find_map(|s| {
+        let commit_segment_index = self.graph.segments().find_map(|s| {
             s.commits
                 .first()
                 .is_some_and(|c| c.id == commit_to_merge)
@@ -324,31 +389,6 @@ impl Workspace {
         })
     }
 
-    /// Try to find the owning graph segment of `commit_id` in the workspace.
-    ///
-    /// This uses the stack segment's `commits_by_segment` offsets to map a projected
-    /// commit back to its source graph segment.
-    pub fn find_commit_segment_index(&self, commit_id: gix::ObjectId) -> Option<SegmentIndex> {
-        let (stack_segment, commit_offset) = self.stacks.iter().find_map(|stack| {
-            stack.segments.iter().find_map(|seg| {
-                seg.commits
-                    .iter()
-                    .enumerate()
-                    .find_map(|(offset, commit)| (commit.id == commit_id).then_some((seg, offset)))
-            })
-        })?;
-
-        let mut owning_segment = stack_segment.id;
-        for (segment_id, offset) in &stack_segment.commits_by_segment {
-            if *offset > commit_offset {
-                break;
-            }
-            owning_segment = *segment_id;
-        }
-
-        Some(owning_segment)
-    }
-
     /// Like [`Self::find_segment_and_stack_by_refname`], but fails with an error.
     pub fn try_find_segment_and_stack_by_refname(
         &self,
@@ -414,7 +454,7 @@ impl Workspace {
         format!(
             "{meta}{sign}:{id}:{name} <> ✓{target}{bound}",
             meta = if self.metadata.is_some() { "📕" } else { "" },
-            id = self.id.index(),
+            id = self.id,
             bound = self
                 .lower_bound
                 .map(|base| format!(" on {}", base.to_hex_with_len(7)))
@@ -426,37 +466,76 @@ impl Workspace {
 /// Utilities
 impl TargetRef {
     /// Visit all segments whose commits would be considered 'upstream', or part of the target branch
-    /// whose tip is identified with `target_segment`. The `lower_bound_segment_and_generation` is another way
+    /// whose tip is identified with `target_segment_id`. The `lower_bound` segment is another way
     /// to stop the traversal.
     pub(crate) fn visit_upstream_commits(
         graph: &Graph,
-        target_segment: SegmentIndex,
-        lower_bound_segment_and_generation: Option<(SegmentIndex, usize)>,
+        target_segment_id: usize,
+        lower_bound: Option<usize>,
         mut visit: impl FnMut(&Segment),
     ) {
-        graph.visit_all_segments_including_start_until(target_segment, Direction::Outgoing, |s| {
-            let prune = true;
-            if lower_bound_segment_and_generation.is_some_and(
-                |(lower_bound, lower_bound_generation)| {
-                    s.id == lower_bound || s.generation > lower_bound_generation
-                },
-            ) || s
-                .commits
-                .iter()
-                .any(|c| c.flags.contains(CommitFlags::InWorkspace))
-            {
-                return prune;
-            }
-            visit(s);
-            !prune
+        // Shared-history semantics (the disjoint-target ruling): paint the lower bound's
+        // ancestor set on the carried commit graph, then collect from the target tip until the
+        // walk TOUCHES shared history — the paint, or any workspace-reachable commit. Diverged
+        // commits are never in either, so a rewritten remote is collected at any depth.
+        let cg = graph.commit_graph();
+        let shared_history = lower_bound.and_then(|sidx| {
+            let lb = graph[sidx].commits.first()?.id;
+            // An empty (default) commit graph — hand-assembled graphs — knows no ancestry.
+            cg.node(lb).is_some().then(|| cg.ancestor_marks(lb))
         });
+        let mut touched_shared_history = false;
+        let mut collected: Vec<usize> = Vec::new();
+        graph.visit_all_segments_including_start_until(
+            target_segment_id,
+            Direction::Outgoing,
+            |s| {
+                let prune = true;
+                let in_shared_history = shared_history.as_ref().is_some_and(|shared| {
+                    s.commits
+                        .first()
+                        .and_then(|c| cg.index_of(c.id))
+                        .is_some_and(|i| shared[i])
+                });
+                let in_workspace = s
+                    .commits
+                    .iter()
+                    .any(|c| c.flags.contains(CommitFlags::InWorkspace));
+                touched_shared_history |= in_shared_history || in_workspace;
+                if Some(s.id) == lower_bound || in_shared_history || in_workspace {
+                    return prune;
+                }
+                collected.push(s.id);
+                !prune
+            },
+        );
+        if let Some(shared) = shared_history.as_ref().filter(|_| !touched_shared_history) {
+            // A walk that never touched shared history found a DISJOINT target — nothing is
+            // upstream — unless either side's ancestry ends at a traversal CUT (a raw parent
+            // the walk did not follow), in which case the shared base may lie beyond the
+            // window and everything visible stays.
+            let genuinely_disjoint = !collected
+                .iter()
+                .flat_map(|sidx| graph[*sidx].commits.iter())
+                .any(|c| cg.has_cut_parents(c.id))
+                && !shared
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &marked)| marked && cg.has_cut_parents_at(i));
+            if genuinely_disjoint {
+                return;
+            }
+        }
+        for sidx in collected {
+            visit(&graph[sidx]);
+        }
     }
 }
 
 impl std::fmt::Debug for Workspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(&format!("Workspace({})", self.debug_string()))
-            .field("id", &self.id.index())
+            .field("id", &self.id)
             .field("kind", &self.kind)
             .field("stacks", &self.stacks)
             .field("metadata", &self.metadata)

@@ -232,7 +232,7 @@ impl<'a> UpstreamIntegrationContext<'a> {
                 Options {
                     project_meta: ctx.project_meta()?,
                     expensive_commit_info: true,
-                    traversal: but_graph::init::Options::limited(),
+                    traversal: but_graph::walk::Options::limited(),
                     ..Default::default()
                 },
             )?;

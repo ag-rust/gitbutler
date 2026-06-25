@@ -2,20 +2,32 @@
 //! One graph based engine to rule them all,
 //! one vector based to find them,
 //! one mess of git2 code to bring them all,
-//! and in the darknes bind them.
+//! and in the darkness bind them.
+//!
+//! ---
+//!
+//! A graph-based rebase engine. The workspace is loaded into an `Editor` as a `EditorGraph`: an
+//! arena of `Step`s where a `Pick` is a commit to cherry-pick, while a `Reference` (a branch)
+//! rides as positioned data on a pick.
+//! Callers mutate the graph (insert/move/remove picks, create/move references), then
+//! `Editor::rebase` replays it — cherry-picking every mutable pick onto its new parents and
+//! producing the reference updates to write.
+//!
+//! References are POSITIONS, not entries with edges — see the `positions` module for the model.
 
 mod creation;
+mod editor_graph;
+mod layout;
+mod positions;
 pub mod rebase;
 pub mod traverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
-use but_core::{RefMetadata, commit::SignCommit};
-use but_graph::init::Overlay;
+use anyhow::{Result, bail};
+use but_core::{RefMetadata, commit::SignCommit, ref_metadata::ProjectMeta};
+use but_graph::walk::Overlay;
 pub use creation::GraphEditorOptions;
 use gix::refs::transaction::RefEdit;
-
-use crate::graph_rebase::util::collect_ordered_parents;
 
 use crate::graph_rebase::cherry_pick::{PickMode, TreeMergeMode};
 pub mod cherry_pick;
@@ -30,6 +42,190 @@ pub use workspace::{GraphWorkspace, Subgraph};
 
 /// Utilities for testing
 pub mod testing;
+
+/// Used to manipulate a set of picks.
+#[derive(Debug)]
+pub struct Editor<'meta, M: RefMetadata> {
+    /// The internal graph of steps
+    graph: EditorGraph,
+    /// Initial references, used to spot references that need deleting.
+    initial_references: Vec<gix::refs::FullName>,
+    /// Worktrees that we might need to perform `safe_checkout` on.
+    checkouts: Vec<Checkout>,
+    /// The in-memory repository that the rebase engine works with.
+    repo: gix::Repository,
+    /// Provides data about how the editor instance was transformed.
+    history: RevisionHistory,
+    /// The workspace target configuration the editor was created with.
+    project_meta: ProjectMeta,
+    /// A reference to the metadata that the editor was created for.
+    meta: &'meta mut M,
+}
+
+impl<'meta, M: RefMetadata> Editor<'meta, M> {
+    pub(crate) fn new_selector(&self, id: EditorGraphIndex) -> Selector {
+        Selector { id }
+    }
+}
+
+/// Represents a successful rebase, and any valid, but potentially conflicting scenarios it had.
+#[derive(Debug)]
+pub struct SuccessfulRebase<'meta, M: RefMetadata> {
+    pub(crate) repo: gix::Repository,
+    pub(crate) initial_references: Vec<gix::refs::FullName>,
+    /// Any reference edits that need to be committed as a result of the history
+    /// rewrite
+    pub(crate) ref_edits: Vec<RefEdit>,
+    /// The new commit graph
+    pub(crate) graph: EditorGraph,
+    pub(crate) checkouts: Vec<Checkout>,
+    /// Provides data about how the editor instance was transformed.
+    pub history: RevisionHistory,
+    /// The workspace target configuration the editor was created with.
+    project_meta: ProjectMeta,
+    /// A reference to the metadata that the editor was created for.
+    meta: &'meta mut M,
+}
+
+impl<'meta, M: RefMetadata> SuccessfulRebase<'meta, M> {
+    /// Returns the in-memory repository that backs this rebase preview.
+    ///
+    /// This repository may contain objects that have not been persisted yet,
+    /// which makes it suitable for dry-run inspection of a [`Self::rebase_overlay`] redo.
+    pub fn repo(&self) -> &gix::Repository {
+        &self.repo
+    }
+
+    /// Returns the preview repository together with mutable access to the
+    /// ref-metadata the editor was created with.
+    ///
+    /// Use this to build post-rebase projections that need both, like a
+    /// workspace preview computed from [`Self::rebase_overlay`].
+    pub fn repo_and_meta_mut(&mut self) -> (&gix::Repository, &mut M) {
+        (&self.repo, self.meta)
+    }
+
+    /// Returns the ref-metadata the editor was created with.
+    pub fn meta(&self) -> &M {
+        self.meta
+    }
+
+    /// The mutated commit graph this rebase will materialize — already the next workspace
+    /// state, since materializing only persists objects and applies ref edits. Project it
+    /// (with [`Self::repo`] and [`Self::rebase_overlay`]) to preview without a rewalk.
+    pub fn arena(&self) -> &but_graph::CommitGraph {
+        self.graph.arena()
+    }
+
+    /// The overlay describing this rebase's outcome: updated/dropped refs plus the requested
+    /// checkout as the entrypoint.
+    ///
+    /// Feed it to a graph or workspace redo (with [`Self::repo`], since rewritten objects may
+    /// exist only in memory) to preview the post-rebase state without materializing.
+    pub fn rebase_overlay(&self) -> Result<Overlay> {
+        let dropped_refs = self.ref_edits.iter().filter_map(|edit| match &edit.change {
+            gix::refs::transaction::Change::Delete { .. } => Some(edit.name.clone()),
+            _ => None,
+        });
+        let updated_refs = self.ref_edits.iter().filter_map(|edit| match &edit.change {
+            gix::refs::transaction::Change::Update { new, .. } => Some(gix::refs::Reference {
+                name: edit.name.clone(),
+                target: new.clone(),
+                // TODO(CTO): Peeled is only relevant for symbolic refs?
+                peeled: None,
+            }),
+            _ => None,
+        });
+
+        let Some((entrypoint_id, entrypoint_refname)) = self
+            .checkouts
+            .iter()
+            .filter_map(|checkout| match checkout {
+                Checkout::Head { selector, .. } => match self.graph.step_view(selector.id) {
+                    Step::None => None,
+                    Step::Pick(Pick { id, .. }) => Some((id, None)),
+                    Step::Reference { refname, .. } => {
+                        if let Some(to_reference) = crate::graph_rebase::positions::resolve_to_pick(
+                            &self.graph,
+                            selector.id,
+                        ) && let Some(id) = self.graph.commit_id(to_reference)
+                        {
+                            Some((id, Some(refname)))
+                        } else {
+                            None
+                        }
+                    }
+                },
+            })
+            .next()
+        else {
+            bail!("BUG: Tried to construct rebase engine graph overlay with no entrypoints");
+        };
+
+        Ok(Overlay::default()
+            .with_references(updated_refs)
+            .with_dropped_references(dropped_refs)
+            .with_entrypoint(entrypoint_id, entrypoint_refname))
+    }
+}
+
+/// The outcome of a materialize
+#[derive(Debug)]
+pub struct MaterializeOutcome<'meta, M: RefMetadata> {
+    pub(crate) graph: EditorGraph,
+    /// Provides data about how the editor instance was transformed.
+    pub history: RevisionHistory,
+    /// A reference to the metadata that the editor was created for.
+    pub meta: &'meta mut M,
+}
+
+impl<'meta, M: RefMetadata> MaterializeOutcome<'meta, M> {
+    /// The mutated commit graph the rebase materialized — the next workspace state.
+    /// Feed it to `Workspace::refresh_from_commit_graph` to bring a workspace up to date.
+    pub fn arena(&self) -> &but_graph::CommitGraph {
+        self.graph.arena()
+    }
+}
+
+/// Provides lookup for different steps that a selector might point to.
+pub trait LookupStep {
+    /// Look up the step that a given selector corresponds to.
+    fn lookup_step(&self, selector: Selector) -> Result<Step>;
+
+    /// Look up the step a given selector and assert it's a pick.
+    fn lookup_pick(&self, selector: Selector) -> Result<gix::ObjectId> {
+        match self.lookup_step(selector)? {
+            Step::Pick(Pick { id, .. }) => Ok(id),
+            _ => bail!("Expected selector to point to a pick"),
+        }
+    }
+
+    /// Look up the step a given selector and assert it's a pick.
+    fn lookup_reference(&self, selector: Selector) -> Result<gix::refs::FullName> {
+        match self.lookup_step(selector)? {
+            Step::Reference { refname, .. } => Ok(refname),
+            _ => bail!("Expected selector to point to a reference"),
+        }
+    }
+}
+
+impl<M: RefMetadata> LookupStep for Editor<'_, M> {
+    fn lookup_step(&self, selector: Selector) -> Result<Step> {
+        Ok(self.graph.step_view(selector.id))
+    }
+}
+
+impl<M: RefMetadata> LookupStep for SuccessfulRebase<'_, M> {
+    fn lookup_step(&self, selector: Selector) -> Result<Step> {
+        Ok(self.graph.step_view(selector.id))
+    }
+}
+
+impl<M: RefMetadata> LookupStep for MaterializeOutcome<'_, M> {
+    fn lookup_step(&self, selector: Selector) -> Result<Step> {
+        Ok(self.graph.step_view(selector.id))
+    }
+}
 
 /// Represents a commit to be cherry-picked in a rebase operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,7 +249,7 @@ pub struct Pick {
     pub sign_commit: SignCommit,
     /// Exclude the commit from being included in the
     /// [`RevisionHistory::commit_mappings()`]. This is helpful if we are
-    /// creating a new commit since the the mappings will be non-sensical to the
+    /// creating a new commit since the mappings will be non-sensical to the
     /// frontend consumers.
     pub exclude_from_tracking: bool,
     /// If set to false, the rebase will fail if this commit results in a
@@ -117,7 +313,7 @@ impl Pick {
 pub enum Step {
     /// Cherry picks the given commit into the new location in the graph
     Pick(Pick),
-    /// Represents applying a reference to the commit found at it's first parent
+    /// A reference command, routed into the ref table as positioned data — never a node.
     Reference {
         /// The refname
         refname: gix::refs::FullName,
@@ -128,7 +324,12 @@ pub enum Step {
         /// kept in the graph for traversal but never written.
         mutable: bool,
     },
-    /// Used as a placeholder after removing a pick or reference
+    /// A tombstone left behind when a pick or reference is removed.
+    ///
+    /// The entry is never deleted from the arena — that would invalidate every entry id after it.
+    /// Instead the slot becomes `None`, keeping ids stable. It retains its first
+    /// outgoing edge so that resolving a reference downward walks THROUGH it to the next live
+    /// pick. A tombstone must not survive into materialized output.
     None,
 }
 
@@ -159,25 +360,13 @@ impl Step {
     }
 }
 
-/// Used to represent a connection between a given commit.
-#[derive(Debug, Clone)]
-pub(crate) struct Edge {
-    /// Represents in which order the `parent` fields should be written out
-    ///
-    /// A child commit should have edges that all have unique orders. In order
-    /// to achive that we can employ the following semantics.
-    order: usize,
-}
-
-type StepGraphIndex = petgraph::stable_graph::NodeIndex;
-type StepGraph = petgraph::stable_graph::StableDiGraph<Step, Edge>;
+pub(crate) use editor_graph::{EditorGraph, EditorGraphIndex};
 
 /// Convert a structure to a selector for a particular editor.
 ///
-/// `ToSelector` does _not_ normalize a selector.
 pub trait ToSelector {
     /// Converts a given object into a selector. Calling `to_selector` on an
-    /// object asserts that the reciever was a object that is selectable in the
+    /// object asserts that the receiver was a object that is selectable in the
     /// graph.
     fn to_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector>;
 }
@@ -185,7 +374,7 @@ pub trait ToSelector {
 /// Convert a type to a selector, and ensures that it is type commit.
 pub trait ToCommitSelector {
     /// Converts a given object into a selector. Calling `to_commit_selector` on
-    /// an object asserts that the reciever has a selectable pick step in the
+    /// an object asserts that the receiver has a selectable pick step in the
     /// graph.
     fn to_commit_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector>;
 }
@@ -193,46 +382,41 @@ pub trait ToCommitSelector {
 /// Convert a type to a selector, and ensures that it is type reference.
 pub trait ToReferenceSelector {
     /// Converts a given object into a selector. Calling `to_reference_selector` on
-    /// an object asserts that the reciever has a selectable reference step in
+    /// an object asserts that the receiver has a selectable reference step in
     /// the graph.
     fn to_reference_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector>;
 }
 
 /// Points to a step in the rebase editor.
 ///
-/// Hash, PartialEq, and Eq are implemented for this struct. Because selectors
-/// are a pointer to a node in a particular version of the Editor's internal
-/// representation, it means that you can have two selectors that when
-/// normalised point to the same node. If you want to ensure you have just one
-/// selector to a given node, make sure you are working with selectors all
-/// normalised to the latest revision of the Editor.
+/// Step indices are stable across mutation and rebase — a selector taken at
+/// any point remains valid for the lifetime of the editor. Deleted steps
+/// become tombstones ([`Step::None`]) rather than being removed, so a selector
+/// never dangles, though it may point at a tombstone.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Selector {
-    id: StepGraphIndex,
-    revision: usize,
+    id: EditorGraphIndex,
 }
 
 impl ToCommitSelector for Selector {
     fn to_commit_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector> {
-        let selector = editor.history.normalize_selector(*self)?;
-        let step = &editor.graph[selector.id];
+        let step = editor.graph.step_view(self.id);
         if !matches!(step, Step::Pick(_)) {
             bail!("Expected selector for {step:?} to refer to a commit");
         }
 
-        Ok(selector)
+        Ok(*self)
     }
 }
 
 impl ToReferenceSelector for Selector {
     fn to_reference_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector> {
-        let selector = editor.history.normalize_selector(*self)?;
-        let step = &editor.graph[selector.id];
-        if !matches!(step, Step::Reference { .. }) {
+        if !editor.graph.is_reference(self.id) {
+            let step = editor.graph.step_view(self.id);
             bail!("Expected selector for {step:?} to refer to a reference");
         }
 
-        Ok(selector)
+        Ok(*self)
     }
 }
 
@@ -256,200 +440,15 @@ pub(crate) enum Checkout {
     },
 }
 
-/// Used to manipulate a set of picks.
-#[derive(Debug)]
-pub struct Editor<'ws, 'meta, M: RefMetadata> {
-    /// The internal graph of steps
-    graph: StepGraph,
-    /// Initial references. This is used to track any references that might need
-    /// deleted.
-    initial_references: Vec<gix::refs::FullName>,
-    /// Worktrees that we might need to perform `safe_checkout` on.
-    checkouts: Vec<Checkout>,
-    /// The in-memory repository that the rebase engine works with.
-    repo: gix::Repository,
-    /// Provides data about how the editor instance was transformed.
-    history: RevisionHistory,
-    /// A reference to the workspace that the editor was created for.
-    workspace: &'ws mut but_graph::Workspace,
-    /// A reference to the metadata that the editor was created for.
-    meta: &'meta mut M,
-}
-
-/// Represents a successful rebase, and any valid, but potentially conflicting scenarios it had.
-#[derive(Debug)]
-pub struct SuccessfulRebase<'ws, 'meta, M: RefMetadata> {
-    pub(crate) repo: gix::Repository,
-    pub(crate) initial_references: Vec<gix::refs::FullName>,
-    /// Any reference edits that need to be committed as a result of the history
-    /// rewrite
-    pub(crate) ref_edits: Vec<RefEdit>,
-    /// The new step graph
-    pub(crate) graph: StepGraph,
-    pub(crate) checkouts: Vec<Checkout>,
-    /// Provides data about how the editor instance was transformed.
-    pub history: RevisionHistory,
-    /// A reference to the workspace that the editor was created for.
-    workspace: &'ws mut but_graph::Workspace,
-    /// A reference to the metadata that the editor was created for.
-    meta: &'meta mut M,
-}
-
-impl<'ws, 'meta, M: RefMetadata> SuccessfulRebase<'ws, 'meta, M> {
-    /// Returns the in-memory repository that backs this rebase preview.
-    ///
-    /// This repository may contain objects that have not been persisted yet,
-    /// which makes it suitable for dry-run inspection of [`Self::overlayed_graph`].
-    pub fn repo(&self) -> &gix::Repository {
-        &self.repo
-    }
-
-    /// Returns the preview repository together with mutable access to the
-    /// ref-metadata the editor was created with.
-    ///
-    /// Use this to build post-rebase projections that need both, like a
-    /// workspace preview computed from [`Self::overlayed_graph`].
-    pub fn repo_and_meta_mut(&mut self) -> (&gix::Repository, &mut M) {
-        (&self.repo, self.meta)
-    }
-
-    /// Returns a preview of what the but-graph will look like after
-    /// materialization.
-    ///
-    /// Any objects referenced in the resulting graph must be accessed via the
-    /// in-memory repository owned by this [`SuccessfulRebase`] (`self.repo`),
-    /// since they might exist only in memory.
-    pub fn overlayed_graph(&self) -> Result<but_graph::Graph> {
-        let dropped_refs = self.ref_edits.iter().filter_map(|edit| match &edit.change {
-            gix::refs::transaction::Change::Delete { .. } => Some(edit.name.clone()),
-            _ => None,
-        });
-        let updated_refs = self.ref_edits.iter().filter_map(|edit| match &edit.change {
-            gix::refs::transaction::Change::Update { new, .. } => Some(gix::refs::Reference {
-                name: edit.name.clone(),
-                target: new.clone(),
-                // TODO(CTO): Peeled is only relevant for symbolic refs?
-                peeled: None,
-            }),
-            _ => None,
-        });
-
-        let Some((entrypoint_id, entrypoint_refname)) = self
-            .checkouts
-            .iter()
-            .filter_map(|checkout| match checkout {
-                Checkout::Head { selector, .. } => {
-                    let selector = self.history.normalize_selector(*selector).ok()?;
-                    let step = &self.graph[selector.id];
-
-                    match step {
-                        Step::None => None,
-                        Step::Pick(Pick { id, .. }) => Some((*id, None)),
-                        Step::Reference { refname, .. } => {
-                            let parents = collect_ordered_parents(&self.graph, selector.id);
-
-                            if let Some(to_reference) = parents.first()
-                                && let Step::Pick(Pick { id, .. }) = self.graph[*to_reference]
-                            {
-                                Some((id, Some(refname.clone())))
-                            } else {
-                                None
-                            }
-                        }
-                    }
-                }
-            })
-            .next()
-        else {
-            bail!("BUG: Tried to construct rebase engine graph overlay with no entrypoints");
-        };
-
-        let overlay = Overlay::default()
-            .with_references(updated_refs)
-            .with_dropped_references(dropped_refs)
-            .with_entrypoint(entrypoint_id, entrypoint_refname);
-        self.workspace
-            .graph
-            .redo_traversal_with_overlay(&self.repo, self.meta, overlay)
-    }
-}
-
-/// The outcome of a materialize
-#[derive(Debug)]
-pub struct MaterializeOutcome<'ws, 'meta, M: RefMetadata> {
-    pub(crate) graph: StepGraph,
-    /// Provides data about how the editor instance was transformed.
-    pub history: RevisionHistory,
-    /// A reference to the workspace that the editor was created for.
-    pub workspace: &'ws mut but_graph::Workspace,
-    /// A reference to the metadata that the editor was created for.
-    pub meta: &'meta mut M,
-}
-
-/// Provides lookup for different steps that a selector might point to.
-pub trait LookupStep {
-    /// Look up the step that a given selector corresponds to.
-    fn lookup_step(&self, selector: Selector) -> Result<Step>;
-
-    /// Look up the step a given selector and assert it's a pick.
-    fn lookup_pick(&self, selector: Selector) -> Result<gix::ObjectId> {
-        match self.lookup_step(selector)? {
-            Step::Pick(Pick { id, .. }) => Ok(id),
-            _ => bail!("Expected selector to point to a pick"),
-        }
-    }
-
-    /// Look up the step a given selector and assert it's a pick.
-    fn lookup_reference(&self, selector: Selector) -> Result<gix::refs::FullName> {
-        match self.lookup_step(selector)? {
-            Step::Reference { refname, .. } => Ok(refname),
-            _ => bail!("Expected selector to point to a reference"),
-        }
-    }
-}
-
-impl<M: RefMetadata> LookupStep for Editor<'_, '_, M> {
-    fn lookup_step(&self, selector: Selector) -> Result<Step> {
-        lookup_step(&self.graph, &self.history, selector)
-    }
-}
-
-impl<M: RefMetadata> LookupStep for SuccessfulRebase<'_, '_, M> {
-    fn lookup_step(&self, selector: Selector) -> Result<Step> {
-        lookup_step(&self.graph, &self.history, selector)
-    }
-}
-
-impl<M: RefMetadata> LookupStep for MaterializeOutcome<'_, '_, M> {
-    fn lookup_step(&self, selector: Selector) -> Result<Step> {
-        lookup_step(&self.graph, &self.history, selector)
-    }
-}
-
-fn lookup_step(graph: &StepGraph, history: &RevisionHistory, selector: Selector) -> Result<Step> {
-    let normalized = history.normalize_selector(selector)?;
-    Ok(graph[normalized.id].clone())
-}
-
-/// Provides data about how the editor instance was transformed.
+/// How commit ids moved as the editor transformed the graph.
 #[derive(Debug, Clone, Default)]
 pub struct RevisionHistory {
-    mappings: Vec<HashMap<StepGraphIndex, StepGraphIndex>>,
     /// A mapping from any commits that were in the original mapping to a
     /// rewritten version.
     ///
-    /// Unintuatively, the values are the original values, and the keys are the
+    /// Unintuitively, the values are the original values, and the keys are the
     /// _new_ values that they have been mapped to.
     commit_mappings: BTreeMap<gix::ObjectId, gix::ObjectId>,
-}
-
-impl<'ws, 'meta, M: RefMetadata> Editor<'ws, 'meta, M> {
-    pub(crate) fn new_selector(&self, id: StepGraphIndex) -> Selector {
-        Selector {
-            id,
-            revision: self.history.current_revision(),
-        }
-    }
 }
 
 impl RevisionHistory {
@@ -457,14 +456,10 @@ impl RevisionHistory {
         Default::default()
     }
 
-    pub(crate) fn current_revision(&self) -> usize {
-        self.mappings.len()
-    }
-
     /// The commit mappings starts empty, and gets updated when we perform a cherry pick.
-    /// If there is no entry whose old `to` that cooresponds with the new
+    /// If there is no entry whose old `to` that corresponds with the new
     /// `from`, then we just add a `to <- from` entry.
-    /// If there is an entry whose old `to` that cooresponds with the new
+    /// If there is an entry whose old `to` that corresponds with the new
     /// `from`, then we replace `old_to <- old_from` with `new_to <- old_from`
     pub(crate) fn update_mapping(&mut self, from: gix::ObjectId, to: gix::ObjectId) {
         if let Some(value) = self.commit_mappings.remove(&from) {
@@ -480,20 +475,6 @@ impl RevisionHistory {
             .iter()
             .filter_map(|(k, v)| if k == v { None } else { Some((*v, *k)) })
             .collect()
-    }
-
-    pub(crate) fn normalize_selector(&self, mut selector: Selector) -> Result<Selector> {
-        while selector.revision < self.current_revision() {
-            selector.id = *self.mappings[selector.revision]
-                .get(&selector.id)
-                .context("Failed to normalize selector, selector was missing from the mapping")?;
-            selector.revision += 1;
-        }
-        Ok(selector)
-    }
-
-    pub(crate) fn add_revision(&mut self, mapping: HashMap<StepGraphIndex, StepGraphIndex>) {
-        self.mappings.push(mapping);
     }
 }
 

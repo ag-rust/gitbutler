@@ -96,7 +96,6 @@ pub mod merge {
         RepositoryExt,
         ref_metadata::{MaybeDebug, WorkspaceCommitRelation},
     };
-    use but_graph::SegmentIndex;
     use gix::prelude::ObjectIdExt;
     use tracing::instrument;
 
@@ -105,14 +104,14 @@ pub mod merge {
 
     /// A optionally named tip that can be merged.
     #[derive(Debug, Clone)]
-    pub struct Tip {
+    pub struct Seed {
         /// The name of the reference that points to `commit_id`, or `None` if there is no such reference.
         /// The name is for use in the generated workspace commit message.
         pub name: Option<gix::refs::FullName>,
         /// The commit that should be merged into the workspace commit.
         pub commit_id: gix::ObjectId,
         /// The index to the top-most segment of the stack in the graph for use in merge-base computation.
-        pub segment_idx: SegmentIndex,
+        pub segment_idx: usize,
     }
 
     /// Tips resolved from workspace metadata, with references that metadata mentioned but the graph
@@ -120,7 +119,7 @@ pub mod merge {
     /// Returned by [WorkspaceCommit::tips_from_metadata()].
     pub struct ResolvedTips {
         /// Tips in the order they should appear as workspace commit parents.
-        pub tips: Vec<Tip>,
+        pub tips: Vec<Seed>,
         /// Metadata stack tips that couldn't be found in the graph.
         /// This is usually a problem, as the Graph is expected to contain everything of interest.
         pub missing_stacks: Vec<gix::refs::FullName>,
@@ -179,11 +178,11 @@ pub mod merge {
         /// `anon_stacks` are unnamed projected tips paired with the parent slot they occupied in
         /// the workspace projection, used to preserve anonymous parents not represented in metadata.
         ///
-        /// `graph` resolves metadata branch names to commit and segment ids.
+        /// `workspace` resolves metadata branch names to commit and segment ids.
         pub fn tips_from_metadata<'a>(
             stacks: impl IntoIterator<Item = &'a but_core::ref_metadata::WorkspaceStack>,
-            anon_stacks: impl IntoIterator<Item = (usize, Tip)>,
-            graph: &but_graph::Graph,
+            anon_stacks: impl IntoIterator<Item = (usize, Seed)>,
+            workspace: &but_graph::Workspace,
         ) -> ResolvedTips {
             let mut missing_stacks = Vec::new();
             let mut tips_with_metadata_slots: Vec<_> = stacks
@@ -202,15 +201,15 @@ pub mod merge {
                         WorkspaceCommitRelation::Outside => return None,
                     }
                     let stack_tip_name = top_segment.ref_name.as_ref();
-                    match graph.segment_and_commit_by_ref_name(stack_tip_name) {
+                    match workspace.segment_id_and_commit_id_by_ref_name(stack_tip_name) {
                         None => {
                             missing_stacks.push(top_segment.ref_name.to_owned());
                             None
                         }
-                        Some((segment, commit)) => Some(Tip {
+                        Some((segment_idx, commit_id)) => Some(Seed {
                             name: Some(stack_tip_name.to_owned()),
-                            commit_id: commit.id,
-                            segment_idx: segment.id,
+                            commit_id,
+                            segment_idx,
                         }),
                     }
                 })
@@ -242,8 +241,8 @@ pub mod merge {
         /// even if the tip is unnamed.
         /// Note that [`missing_stacks`](Outcome::missing_stacks) is never set.
         pub fn from_new_merge_with_tips(
-            tips: impl IntoIterator<Item = Tip>,
-            graph: &but_graph::Graph,
+            tips: impl IntoIterator<Item = Seed>,
+            workspace: &but_graph::Workspace,
             repo: &gix::Repository,
             hero_stack: Option<&gix::refs::FullNameRef>,
         ) -> anyhow::Result<Outcome> {
@@ -251,7 +250,7 @@ pub mod merge {
             enum Instruction {
                 Merge,
                 MergeTrial {
-                    hero_sidx: SegmentIndex,
+                    hero_sidx: usize,
                     hero_tree_id: gix::ObjectId,
                 },
                 Skip,
@@ -266,7 +265,7 @@ pub mod merge {
                     }
                 }
             }
-            let mut tips: Vec<(Instruction, Tip)> =
+            let mut tips: Vec<(Instruction, Seed)> =
                 tips.into_iter().map(|t| (I::Merge, t)).collect();
 
             let mut ran_merge_trials_loop_safety = false;
@@ -280,7 +279,7 @@ pub mod merge {
                 'tips_loop: for tip_idx in 0..tips.len() {
                     let (
                         mode,
-                        Tip {
+                        Seed {
                             name: ref_name,
                             commit_id,
                             segment_idx: sidx,
@@ -298,7 +297,7 @@ pub mod merge {
                             // This is the same as computing the merge-base between the new
                             // (non-existing merge-commit) and the next tip.
                             let left = prev_base_sidx.unwrap_or(prev_sidx);
-                            compute_merge_base(graph, repo, left, sidx)?
+                            compute_merge_base(workspace, repo, left, sidx)?
                         };
 
                         let mut merge = repo.merge_trees(
@@ -392,7 +391,7 @@ pub mod merge {
                             // This stack merged cleanly, and now we have to merge the hero into that result to see if it works.
                             // This tells us if this is stack merges cleanly or causes a real conflict in conjunction with hero.
                             let base_tree_id =
-                                compute_merge_base(graph, repo, base_sidx, hero_sidx)?.0;
+                                compute_merge_base(workspace, repo, base_sidx, hero_sidx)?.0;
                             let merge = repo.merge_trees(
                                 base_tree_id,
                                 merge.tree.write()?,
@@ -423,7 +422,7 @@ pub mod merge {
                     |(mut stacks, mut conflicting_stacks),
                      (
                         mode,
-                        Tip {
+                        Seed {
                             name: ref_name,
                             commit_id,
                             ..
@@ -474,7 +473,7 @@ pub mod merge {
         }
 
         /// Using the names of the `stacks` stored in [workspace metadata](but_core::ref_metadata::Workspace),
-        /// create a new workspace commit with their tips extracted from `graph`. Note that stacks that don't exist in `graph` aren't fatal.
+        /// create a new workspace commit with their tips extracted from `workspace`. Note that stacks that don't exist in the graph aren't fatal.
         /// Also, this will create a workspace commit as it's desired, but not as it is, and the caller should assure that all branches are present.
         ///
         /// Use `anon_stacks` with `(parent_index, tip)` to fill-in anonymous commits that aren't listed in metadata,
@@ -495,50 +494,44 @@ pub mod merge {
         #[instrument(
             name = "re-merge workspace commit",
             level = "debug",
-            skip(stacks, anon_stacks, graph, repo),
+            skip(stacks, anon_stacks, workspace, repo),
             err(Debug)
         )]
         pub fn from_new_merge_with_metadata<'a>(
             stacks: impl IntoIterator<Item = &'a but_core::ref_metadata::WorkspaceStack>,
-            anon_stacks: impl IntoIterator<Item = (usize, Tip)>,
-            graph: &but_graph::Graph,
+            anon_stacks: impl IntoIterator<Item = (usize, Seed)>,
+            workspace: &but_graph::Workspace,
             repo: &gix::Repository,
             hero_stack: Option<&gix::refs::FullNameRef>,
         ) -> anyhow::Result<Outcome> {
             let ResolvedTips {
                 tips,
                 missing_stacks,
-            } = Self::tips_from_metadata(stacks, anon_stacks, graph);
-            let mut out = Self::from_new_merge_with_tips(tips, graph, repo, hero_stack)?;
+            } = Self::tips_from_metadata(stacks, anon_stacks, workspace);
+            let mut out = Self::from_new_merge_with_tips(tips, workspace, repo, hero_stack)?;
             out.missing_stacks = missing_stacks;
             Ok(out)
         }
     }
 
     fn compute_merge_base(
-        graph: &but_graph::Graph,
+        workspace: &but_graph::Workspace,
         repo: &gix::Repository,
-        left: SegmentIndex,
-        right: SegmentIndex,
-    ) -> anyhow::Result<(gix::ObjectId, SegmentIndex)> {
-        let base_sidx = graph.find_merge_base(left, right).with_context(|| {
+        left: usize,
+        right: usize,
+    ) -> anyhow::Result<(gix::ObjectId, usize)> {
+        let base_sidx = workspace.merge_base_segment_id(left, right).with_context(|| {
             format!(
-                "Couldn't find merge-base between segments {l} and {r} - they are disjoint in the commit-graph",
-                l = left.index(),
-                r = right.index()
+                "Couldn't find merge-base between segments {left} and {right} - they are disjoint in the commit-graph"
             )
         })?;
-        let base_commit_id = graph
-            .tip_skip_empty(base_sidx)
+        let base_commit_id = workspace
+            .tip_commit_id_skip_empty(base_sidx)
             .with_context(|| {
                 format!(
-                    "Base segment {base} between {l} and {r} didn't have  single commit reachable",
-                    base = base_sidx.index(),
-                    l = left.index(),
-                    r = right.index()
+                    "Base segment {base_sidx} between {left} and {right} didn't have a single commit reachable"
                 )
             })?
-            .id
             .attach(repo);
         Ok((peel_to_tree(base_commit_id)?, base_sidx))
     }

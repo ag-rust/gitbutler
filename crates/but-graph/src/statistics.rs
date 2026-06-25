@@ -1,8 +1,6 @@
-use petgraph::Direction;
+use crate::Direction;
 
-use crate::{
-    CommitFlags, CommitIndex, Graph, SegmentIndex, SegmentMetadata, init::types::TopoWalk,
-};
+use crate::{CommitFlags, CommitIndex, Graph, SegmentMetadata, walk::types::TopoWalk};
 
 impl Graph {
     /// Return the number segments whose commits are all exclusively in a remote.
@@ -33,8 +31,8 @@ impl Graph {
             commits_at_cutoff,
         } = &mut out;
 
-        *segments = self.inner.node_count();
-        *connections = self.inner.edge_count();
+        *segments = self.segment_count();
+        *connections = self.edge_count();
         *top_segments = self
             .tip_segments()
             .map(|s| {
@@ -56,11 +54,9 @@ impl Graph {
                 .first()
                 .map(|c| c.flags.contains(CommitFlags::InWorkspace));
             *segment_entrypoint_incoming = self
-                .inner
                 .edges_directed(ep.segment.id, Direction::Incoming)
                 .count();
             *segment_entrypoint_outgoing = self
-                .inner
                 .edges_directed(ep.segment.id, Direction::Outgoing)
                 .count();
             for (storage, direction, start_cidx) in [
@@ -77,13 +73,13 @@ impl Graph {
             ] {
                 let mut walk =
                     TopoWalk::start_from(ep.segment.id, start_cidx, direction).skip_tip_segment();
-                while walk.next(&self.inner).is_some() {
+                while walk.next(self).is_some() {
                     *storage += 1;
                 }
             }
         }
 
-        for n in self.inner.node_indices().map(|n| &self[n]) {
+        for n in self.segment_ids().map(|n| &self[n]) {
             *commits += n.commits.len();
 
             if n.ref_info.is_none() {
@@ -127,7 +123,7 @@ impl Graph {
             *commit_references += n.commits.iter().map(|c| c.refs.len()).sum::<usize>();
         }
 
-        for sidx in self.inner.node_indices() {
+        for sidx in self.segment_ids() {
             *commits_at_cutoff += usize::from(
                 self.stop_condition(sidx)
                     .is_some_and(|condition| condition.is_unnatural()),
@@ -172,17 +168,13 @@ pub struct Statistics {
     /// Segments, excluding the entrypoint, that can be reached upwards through the entrypoint.
     pub segments_ahead_of_entrypoint: usize,
     /// The entrypoint of the graph traversal.
-    pub entrypoint: (SegmentIndex, Option<CommitIndex>),
+    pub entrypoint: (usize, Option<CommitIndex>),
     /// The number of incoming connections into the entrypoint segment.
     pub segment_entrypoint_incoming: usize,
     /// The number of outgoing connections into the entrypoint segment.
     pub segment_entrypoint_outgoing: usize,
     /// Segments without incoming connections.
-    pub top_segments: Vec<(
-        Option<gix::refs::FullName>,
-        SegmentIndex,
-        Option<CommitFlags>,
-    )>,
+    pub top_segments: Vec<(Option<gix::refs::FullName>, usize, Option<CommitFlags>)>,
     /// Segments without outgoing connections.
     pub segments_at_bottom: usize,
     /// Connections between segments.

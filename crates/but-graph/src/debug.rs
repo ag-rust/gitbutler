@@ -1,13 +1,22 @@
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::segment_graph::EdgeRef;
 use anyhow::{Context as _, bail};
 use bstr::{BString, ByteSlice, ByteVec};
 use gix::reference::Category;
-use petgraph::{prelude::EdgeRef, stable_graph::EdgeReference};
 
-use crate::{
-    CommitFlags, Edge, Graph, Segment, SegmentIndex, SegmentMetadata, StopCondition, init::PetGraph,
-};
+use crate::{CommitFlags, Graph, Segment, SegmentMetadata, StopCondition};
+
+/// Debugging
+impl crate::Workspace {
+    /// Like [`Graph::anonymize`], but re-projecting afterwards so the workspace view reflects
+    /// the anonymized names.
+    pub fn anonymize(&mut self, remotes: &gix::remote::Names) -> anyhow::Result<&mut Self> {
+        self.graph.anonymize(remotes)?;
+        *self = self.graph.clone().into_workspace()?;
+        Ok(self)
+    }
+}
 
 /// Debugging
 impl Graph {
@@ -97,17 +106,17 @@ impl Graph {
             }
             Ok(())
         };
-        for node in self.inner.node_weights_mut() {
-            if let Some(ri) = node.ref_info.as_mut() {
+        for segment in self.segments_mut() {
+            if let Some(ri) = segment.ref_info.as_mut() {
                 anon(&mut ri.ref_name)?;
             }
-            if let Some(rn) = node.remote_tracking_ref_name.as_mut() {
+            if let Some(rn) = segment.remote_tracking_ref_name.as_mut() {
                 anon(rn)?;
             }
-            for ri in node.commits.iter_mut().flat_map(|c| c.refs.iter_mut()) {
+            for ri in segment.commits.iter_mut().flat_map(|c| c.refs.iter_mut()) {
                 anon(&mut ri.ref_name)?;
             }
-            if let Some(SegmentMetadata::Workspace(md)) = node.metadata.as_mut() {
+            if let Some(SegmentMetadata::Workspace(md)) = segment.metadata.as_mut() {
                 for rn in md
                     .stacks
                     .iter_mut()
@@ -119,25 +128,8 @@ impl Graph {
         }
         Ok(self)
     }
-    /// Produce a string that concisely represents `commit`, adding `extra` information as needed.
-    pub fn commit_debug_string(
-        commit: &crate::Commit,
-        is_entrypoint: bool,
-        stop_condition: Option<StopCondition>,
-        hard_limit: bool,
-        max_goals: Option<usize>,
-    ) -> String {
-        Self::commit_debug_string_inner(
-            commit,
-            is_entrypoint,
-            stop_condition,
-            hard_limit,
-            max_goals,
-            false,
-        )
-    }
 
-    /// Like [`Self::commit_debug_string()`], but includes graph-contextual worktree ownership markers.
+    /// Like `Self::commit_debug_string()`, but includes graph-contextual worktree ownership markers.
     pub fn commit_debug_string_with_graph_context(
         &self,
         commit: &crate::Commit,
@@ -204,14 +196,14 @@ impl Graph {
     }
 
     /// Shorten the given `name` so it's still clear if it is a special ref (like tag) or not.
-    pub fn ref_debug_string(
+    pub(crate) fn ref_debug_string(
         ref_name: &gix::refs::FullNameRef,
         worktree: Option<&crate::Worktree>,
     ) -> String {
         Self::ref_debug_string_inner(ref_name, worktree, false)
     }
 
-    /// Like [`Self::ref_debug_string()`], but includes graph-contextual worktree ownership markers.
+    /// Like `Self::ref_debug_string()`, but includes graph-contextual worktree ownership markers.
     pub fn ref_debug_string_with_graph_context(
         &self,
         ref_name: &gix::refs::FullNameRef,
@@ -246,11 +238,11 @@ impl Graph {
 
     /// Return a useful one-line string showing the relationship between `ref_name`, `remote_ref_name` and how
     /// they are linked with `sibling_id` and `remote_tracking_branch_id`.
-    pub fn ref_and_remote_debug_string(
+    pub(crate) fn ref_and_remote_debug_string(
         ref_info: Option<&crate::RefInfo>,
         remote_ref_name: Option<&gix::refs::FullName>,
-        sibling_id: Option<SegmentIndex>,
-        remote_tracking_branch_id: Option<SegmentIndex>,
+        sibling_id: Option<usize>,
+        remote_tracking_branch_id: Option<usize>,
     ) -> String {
         Self::ref_and_remote_debug_string_inner(
             ref_info,
@@ -261,13 +253,13 @@ impl Graph {
         )
     }
 
-    /// Like [`Self::ref_and_remote_debug_string()`], but includes graph-contextual worktree ownership markers.
+    /// Like `Self::ref_and_remote_debug_string()`, but includes graph-contextual worktree ownership markers.
     pub fn ref_and_remote_debug_string_with_graph_context(
         &self,
         ref_info: Option<&crate::RefInfo>,
         remote_ref_name: Option<&gix::refs::FullName>,
-        sibling_id: Option<SegmentIndex>,
-        remote_tracking_branch_id: Option<SegmentIndex>,
+        sibling_id: Option<usize>,
+        remote_tracking_branch_id: Option<usize>,
     ) -> String {
         Self::ref_and_remote_debug_string_inner(
             ref_info,
@@ -281,8 +273,8 @@ impl Graph {
     fn ref_and_remote_debug_string_inner(
         ref_info: Option<&crate::RefInfo>,
         remote_ref_name: Option<&gix::refs::FullName>,
-        sibling_id: Option<SegmentIndex>,
-        remote_tracking_branch_id: Option<SegmentIndex>,
+        sibling_id: Option<usize>,
+        remote_tracking_branch_id: Option<usize>,
         show_owned_by_repo: bool,
     ) -> String {
         format!(
@@ -298,14 +290,12 @@ impl Graph {
                     ),
                     maybe_id = sibling_id
                         .filter(|_| remote_ref_name.is_none())
-                        .map(|id| format!(" →:{}:", id.index()))
+                        .map(|id| format!(" →:{id}:"))
                         .unwrap_or_default()
                 ))
                 .unwrap_or_else(|| format!(
                     "anon:{maybe_id}",
-                    maybe_id = sibling_id
-                        .map(|id| format!(" →:{}:", id.index()))
-                        .unwrap_or_default()
+                    maybe_id = sibling_id.map(|id| format!(" →:{id}:")).unwrap_or_default()
                 )),
             remote = remote_ref_name
                 .as_ref()
@@ -314,7 +304,7 @@ impl Graph {
                     remote_name = Graph::ref_debug_string(remote_ref_name.as_ref(), None),
                     maybe_id = remote_tracking_branch_id
                         .or(sibling_id)
-                        .map(|id| format!(" →:{}:", id.index()))
+                        .map(|id| format!(" →:{id}:"))
                         .unwrap_or_default()
                 ))
                 .unwrap_or_default()
@@ -325,9 +315,8 @@ impl Graph {
     /// Mostly useful for debugging to stop early when a connection wasn't created correctly.
     #[cfg(unix)]
     pub fn validated_or_open_as_svg(self) -> anyhow::Result<Self> {
-        use petgraph::visit::IntoEdgeReferences;
-        for edge in self.inner.edge_references() {
-            let res = Self::check_edge(&self.inner, edge, false);
+        for edge in self.edge_references() {
+            let res = Self::check_edge(&self, edge, false);
             if res.is_err() {
                 self.open_as_svg();
             }
@@ -399,7 +388,7 @@ impl Graph {
     /// This relates to the amount of commits who were tracked for reachability, i.e. allowing an ancestor to see
     /// if a particular commit is in its future.
     pub fn max_goals(&self) -> Option<usize> {
-        self.node_weights()
+        self.segments()
             .filter_map(|s| s.commits.iter().map(|c| c.flags.num_goals()).max())
             .max()
     }
@@ -407,7 +396,7 @@ impl Graph {
     /// Return `true` if more than one unique worktree is referenced by the graph.
     pub(crate) fn has_multiple_worktrees(&self) -> bool {
         let mut first: Option<&crate::WorktreeKind> = None;
-        self.node_weights()
+        self.segments()
             .flat_map(|segment| {
                 segment
                     .ref_info
@@ -446,7 +435,8 @@ impl Graph {
         let entrypoint = self.entrypoint_location();
         let max_goals = self.max_goals();
         let show_owned_by_repo = self.has_multiple_worktrees();
-        let node_attrs = |_: &PetGraph, (sidx, s): (SegmentIndex, &Segment)| {
+        let generations = self.derived_generations();
+        let segment_attrs = |_: &Graph, (sidx, s): (usize, &Segment)| {
             let name = format!(
                 "{ref_name_and_remote}{maybe_centering_newline}",
                 ref_name_and_remote = Self::ref_and_remote_debug_string_inner(
@@ -474,7 +464,7 @@ impl Graph {
                         } else {
                             self.stop_condition(sidx)
                         },
-                        self.hard_limit_hit,
+                        self.hard_limit_hit(),
                         max_goals,
                         show_owned_by_repo,
                     )
@@ -507,16 +497,14 @@ impl Graph {
                     }
                 },
                 entrypoint = if show_segment_entrypoint { "👉" } else { "" },
-                id = sidx.index(),
-                generation = s.generation,
+                id = sidx,
+                generation = generations.get(sidx),
             )
         };
 
-        let edge_attrs = &|g: &PetGraph, e: EdgeReference<'_, Edge>| {
-            let src = &g[e.source()];
-            let dst = &g[e.target()];
+        let edge_attrs = &|g: &Graph, e: EdgeRef<'_>| {
             // Graphs may be half-baked, let's not worry about it then.
-            if self.hard_limit_hit {
+            if self.hard_limit_hit() {
                 return ", label = \"\"".into();
             }
             // Don't mark connections from the last commit to the first one,
@@ -524,27 +512,34 @@ impl Graph {
             let Err(err) = Self::check_edge(g, e, true) else {
                 return ", label = \"\"".into();
             };
-            let e = e.weight();
-            let src = src
-                .commit_id_by_index(e.src)
+            let e = e.connection;
+            let src = e
+                .src_id()
                 .map(|c| c.to_hex_with_len(HEX).to_string())
                 .unwrap_or_else(|| "src".into());
-            let dst = dst
-                .commit_id_by_index(e.dst)
+            let dst = e
+                .dst_id()
                 .map(|c| c.to_hex_with_len(HEX).to_string())
                 .unwrap_or_else(|| "dst".into());
             format!(", label = \"⚠{src} → {dst} ({err})\", fontname = Courier")
         };
-        let dot = petgraph::dot::Dot::with_attr_getters(&self.inner, &[], &edge_attrs, &node_attrs);
-        format!("{dot:?}")
+        let mut dot = String::from("digraph {\n");
+        for sidx in self.segment_ids() {
+            let attrs = segment_attrs(self, (sidx, &self[sidx]));
+            dot.push_str(&format!("    {sidx} [ label = \"{sidx}\"{attrs} ]\n"));
+        }
+        for e in self.edge_references() {
+            let (src, dst) = (e.source, e.target);
+            let attrs = edge_attrs(self, e);
+            dot.push_str(&format!("    {src} -> {dst} [ label = \"\"{attrs} ]\n"));
+        }
+        dot.push_str("}\n");
+        dot
     }
 
     // WARNING: should only be run on a fresh clone as it probably leaves the graph unusable.
     fn prune_for_dot_graph(&mut self) {
-        let lower_bound_segment_id = self
-            .to_workspace_state(crate::workspace::workspace::Downgrade::Allow)
-            .ok()
-            .and_then(|state| state.lower_bound_segment_id);
+        let lower_bound_segment_id = self.workspace_lower_bound_segment_id();
         if let Some(lower_bound_segment_id) = lower_bound_segment_id {
             self.remove_in_workspace_flag_below_lower_bound(lower_bound_segment_id);
         }
@@ -554,7 +549,7 @@ impl Graph {
         let mut to_remove = self.num_segments().saturating_sub(LIMIT);
         if to_remove > 0 {
             tracing::warn!(
-                "Pruning at most {to_remove} nodes from the bottom to assure 'dot' won't hang",
+                "Pruning at most {to_remove} segments from the bottom to assure 'dot' won't hang",
             );
             let mut next = VecDeque::new();
             next.extend(self.base_segments());
@@ -563,7 +558,7 @@ impl Graph {
                 if to_remove == 0 {
                     break;
                 }
-                if let Some(s) = self.node_weight(sidx) {
+                if let Some(s) = self.segment(sidx) {
                     if lower_bound_segment_id.is_some()
                         && s.non_empty_flags_of_first_commit()
                             .is_some_and(|flags| flags.contains(CommitFlags::InWorkspace))
@@ -578,32 +573,32 @@ impl Graph {
                     }
                 }
                 next.extend(
-                    self.neighbors_directed(sidx, petgraph::Direction::Incoming)
+                    self.neighbors_directed(sidx, crate::Direction::Incoming)
                         .filter(|n| seen.insert_unseen(*n)),
                 );
-                self.remove_node(sidx);
+                self.remove_segment(sidx);
                 to_remove -= 1;
             }
             if to_remove != 0 {
                 tracing::warn!(
-                    "{to_remove} extra nodes were kept to keep vital portions of the graph"
+                    "{to_remove} extra segments were kept to keep vital portions of the graph"
                 );
             }
             self.set_hard_limit_hit();
         }
     }
 
-    fn remove_in_workspace_flag_below_lower_bound(&mut self, lower_bound_segment_id: SegmentIndex) {
+    fn remove_in_workspace_flag_below_lower_bound(&mut self, lower_bound_segment_id: usize) {
         let mut seen = self.seen_table();
         seen.insert_unseen(lower_bound_segment_id);
         let mut queue = VecDeque::from([lower_bound_segment_id]);
         while let Some(sidx) = queue.pop_front() {
             let below_segments: Vec<_> = self
-                .neighbors_directed(sidx, petgraph::Direction::Outgoing)
+                .neighbors_directed(sidx, crate::Direction::Outgoing)
                 .filter(|n| seen.insert_unseen(*n))
                 .collect();
             for below_sidx in below_segments {
-                if let Some(segment) = self.node_weight_mut(below_sidx)
+                if let Some(segment) = self.segment_mut(below_sidx)
                     && let Some(first_commit) = segment.commits.first_mut()
                 {
                     first_commit.flags.remove(CommitFlags::InWorkspace);

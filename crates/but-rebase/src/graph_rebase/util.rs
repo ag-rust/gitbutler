@@ -1,48 +1,68 @@
-//! Utilities around the step graph for internal use.
+//! Utilities around the commit graph for internal use.
 
 use std::collections::HashSet;
 
-use petgraph::visit::EdgeRef as _;
+use crate::graph_rebase::{EditorGraph, EditorGraphIndex};
 
-use crate::graph_rebase::{Pick, Step, StepGraph, StepGraphIndex};
-
-/// Find the parents of a given node that are commit - in correct parent
-/// ordering.
+/// Pruned depth-first search for `target`'s commit parents in parent order, descending through
+/// non-commit steps.
 ///
-/// We do this via a pruned depth first search.
+/// A parent slot that carries a reference group (the slot is a stored edge entry of a group
+/// positioned at its pick) yields to any plain slot resolving to the same pick, and only the
+/// first of several carrying slots survives — the same collapse the entry-era search produced
+/// when a ref path and a direct path reached one pick. Plain duplicate slots are all kept
+/// (dup-parents workspace commits).
 pub(crate) fn collect_ordered_parents(
-    graph: &StepGraph,
-    target: StepGraphIndex,
-) -> Vec<StepGraphIndex> {
-    let mut potential_parent_edges = graph
-        .edges_directed(target, petgraph::Direction::Outgoing)
-        .collect::<Vec<_>>();
-    potential_parent_edges.sort_by_key(|e| e.weight().order);
-    potential_parent_edges.reverse();
-
-    let mut seen = potential_parent_edges
+    graph: &EditorGraph,
+    target: EditorGraphIndex,
+) -> Vec<EditorGraphIndex> {
+    // The slots whose edge is a stored edge entry of some positioned group. An edge in a
+    // group's share always enters the pick the group is positioned on, so matching the slot's
+    // parent again is redundant — one pass over the refs covers every slot.
+    let carried_slots: HashSet<usize> = graph
+        .positioned_refs()
+        .flat_map(|(entry, _)| crate::graph_rebase::positions::edges_through(graph, entry))
+        .filter(|&(child, _)| child == target)
+        .map(|(_, slot)| slot)
+        .collect();
+    let carries_group = |slot: usize, parent: EditorGraphIndex| {
+        graph.is_pick(parent) && carried_slots.contains(&slot)
+    };
+    let slot_parents = graph.parents(target);
+    let plain_targets: HashSet<EditorGraphIndex> = slot_parents
         .iter()
-        .map(|e| e.target())
-        .collect::<HashSet<_>>();
+        .enumerate()
+        .filter(|&(slot, &parent)| graph.is_pick(parent) && !carries_group(slot, parent))
+        .map(|(_, &parent)| parent)
+        .collect();
+    let mut emitted_carrying = HashSet::new();
+
+    let mut potential: Vec<(EditorGraphIndex, bool)> = slot_parents
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(slot, &parent)| (parent, carries_group(slot, parent)))
+        .collect();
+    let mut seen = potential
+        .iter()
+        .map(|(t, _)| *t)
+        .collect::<HashSet<EditorGraphIndex>>();
 
     let mut parents = vec![];
 
-    while let Some(candidate) = potential_parent_edges.pop() {
-        if let Step::Pick(Pick { .. }) = graph[candidate.target()] {
-            parents.push(candidate.target());
+    while let Some((entry, carrying)) = potential.pop() {
+        if graph.is_pick(entry) {
+            if carrying && (plain_targets.contains(&entry) || !emitted_carrying.insert(entry)) {
+                continue;
+            }
+            parents.push(entry);
             // Don't pursue the children
             continue;
         };
 
-        let mut outgoings = graph
-            .edges_directed(candidate.target(), petgraph::Direction::Outgoing)
-            .collect::<Vec<_>>();
-        outgoings.sort_by_key(|e| e.weight().order);
-        outgoings.reverse();
-
-        for edge in outgoings {
-            if seen.insert(edge.target()) {
-                potential_parent_edges.push(edge);
+        for &parent in graph.parents(entry).iter().rev() {
+            if seen.insert(parent) {
+                potential.push((parent, false));
             }
         }
     }
@@ -57,18 +77,18 @@ mod test {
 
         use anyhow::Result;
 
-        use crate::graph_rebase::{Edge, Step, StepGraph, util::collect_ordered_parents};
+        use crate::graph_rebase::{EditorGraph, Step, util::collect_ordered_parents};
 
         #[test]
         fn basic_scenario() -> Result<()> {
-            let mut graph = StepGraph::new();
+            let mut graph = EditorGraph::default();
             let a_id = gix::ObjectId::from_str("1000000000000000000000000000000000000000")?;
             let a = graph.add_node(Step::new_pick(a_id));
             // First parent
             let b_id = gix::ObjectId::from_str("1000000000000000000000000000000000000000")?;
             let b = graph.add_node(Step::new_pick(b_id));
-            // Second parent - is a reference
-            let c = graph.add_node(Step::new_reference("refs/heads/foobar".try_into()?));
+            // Second parent - is a tombstone, so it flattens to its own parents
+            let c = graph.add_node(Step::None);
             // Second parent's first child
             let d_id = gix::ObjectId::from_str("3000000000000000000000000000000000000000")?;
             let d = graph.add_node(Step::new_pick(d_id));
@@ -80,51 +100,16 @@ mod test {
             let f = graph.add_node(Step::new_pick(f_id));
 
             // A's parents
-            graph.add_edge(a, b, Edge { order: 0 });
-            graph.add_edge(a, c, Edge { order: 1 });
-            graph.add_edge(a, f, Edge { order: 2 });
+            graph.push_parent(a, b);
+            graph.push_parent(a, c);
+            graph.push_parent(a, f);
 
             // C's parents
-            graph.add_edge(c, d, Edge { order: 0 });
-            graph.add_edge(c, e, Edge { order: 1 });
+            graph.push_parent(c, d);
+            graph.push_parent(c, e);
 
             let parents = collect_ordered_parents(&graph, a);
             assert_eq!(&parents, &[b, d, e, f]);
-
-            Ok(())
-        }
-
-        #[test]
-        fn insertion_order_is_irrelevant() -> Result<()> {
-            let mut graph = StepGraph::new();
-            let a_id = gix::ObjectId::from_str("1000000000000000000000000000000000000000")?;
-            let a = graph.add_node(Step::new_pick(a_id));
-            // First parent
-            let b_id = gix::ObjectId::from_str("1000000000000000000000000000000000000000")?;
-            let b = graph.add_node(Step::new_pick(b_id));
-            // Second parent - is a reference
-            let c = graph.add_node(Step::new_reference("refs/heads/foobar".try_into()?));
-            // Second parent's second child
-            let d_id = gix::ObjectId::from_str("3000000000000000000000000000000000000000")?;
-            let d = graph.add_node(Step::new_pick(d_id));
-            // Second parent's first child
-            let e_id = gix::ObjectId::from_str("4000000000000000000000000000000000000000")?;
-            let e = graph.add_node(Step::new_pick(e_id));
-            // Third parent
-            let f_id = gix::ObjectId::from_str("5000000000000000000000000000000000000000")?;
-            let f = graph.add_node(Step::new_pick(f_id));
-
-            // A's parents
-            graph.add_edge(a, f, Edge { order: 2 });
-            graph.add_edge(a, c, Edge { order: 1 });
-            graph.add_edge(a, b, Edge { order: 0 });
-
-            // C's parents
-            graph.add_edge(c, d, Edge { order: 1 });
-            graph.add_edge(c, e, Edge { order: 0 });
-
-            let parents = collect_ordered_parents(&graph, a);
-            assert_eq!(&parents, &[b, e, d, f]);
 
             Ok(())
         }

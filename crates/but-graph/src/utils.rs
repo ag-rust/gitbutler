@@ -1,18 +1,18 @@
 use std::collections::VecDeque;
 
-use petgraph::{Direction, visit::NodeIndexable};
+use crate::Direction;
 
-use crate::{Graph, Segment, SegmentIndex};
+use crate::{Graph, Segment};
 
 impl Graph {
     pub(crate) fn seen_table(&self) -> SeenTable {
-        SeenTable::new(self.inner.node_bound())
+        SeenTable::new(self.id_bound())
     }
 }
 
 /// Fixed-size storage for tracking visited segments during graph walks.
 ///
-/// Unlike [`SegmentTable<bool>`], this type only represents one concept:
+/// Unlike [`ScratchTable<bool>`], this type only represents one concept:
 /// whether a segment was seen in the current walk. It is intentionally static:
 /// create it after the graph shape is known, and don't use it for segments
 /// inserted after construction.
@@ -31,8 +31,8 @@ impl SeenTable {
     /// Insert `sidx` into the seen set if it wasn't present yet.
     ///
     /// Returns `true` if `sidx` was unseen before this call.
-    pub(crate) fn insert_unseen(&mut self, sidx: SegmentIndex) -> bool {
-        let value = &mut self.values[sidx.index()];
+    pub(crate) fn insert_unseen(&mut self, sidx: usize) -> bool {
+        let value = &mut self.values[sidx];
         if *value {
             return false;
         }
@@ -41,10 +41,10 @@ impl SeenTable {
     }
 }
 
-/// Scratch storage keyed directly by [`SegmentIndex`].
+/// Scratch storage keyed directly by segment index.
 ///
-/// Segment indices are dense `petgraph::NodeIndex` values while a graph is alive,
-/// so a vector indexed by `SegmentIndex::index()` is a perfect lookup table and
+/// Segment indices are dense `usize` values while a graph is alive,
+/// so a vector indexed by them is a perfect lookup table and
 /// avoids hash-map overhead in hot graph algorithms. This table is fixed-size:
 /// create it after the graph shape is known and use it only while no newly
 /// inserted segment can be addressed through it.
@@ -52,17 +52,17 @@ impl SeenTable {
 /// Instead of clearing the whole vector between phases, it remembers which slots
 /// changed away from `empty` and resets only those slots. This keeps reuse cheap
 /// for walks that touch a small part of a large graph.
-pub(crate) struct SegmentTable<T> {
+pub(crate) struct ScratchTable<T> {
     values: Vec<T>,
-    touched: Vec<SegmentIndex>,
+    touched: Vec<usize>,
     empty: T,
 }
 
-impl<T: Copy + PartialEq> SegmentTable<T> {
+impl<T: Copy + PartialEq> ScratchTable<T> {
     /// Create a fixed-size table with one slot for every segment index currently
     /// representable by `node_bound`.
     pub(crate) fn new(node_bound: usize, empty: T) -> Self {
-        SegmentTable {
+        ScratchTable {
             values: vec![empty; node_bound],
             touched: Vec::new(),
             empty,
@@ -72,19 +72,19 @@ impl<T: Copy + PartialEq> SegmentTable<T> {
     /// Reset all slots touched since the last clear back to the `empty` value.
     pub(crate) fn clear(&mut self) {
         for sidx in self.touched.drain(..) {
-            self.values[sidx.index()] = self.empty;
+            self.values[sidx] = self.empty;
         }
     }
 
     /// Return the value stored for `sidx`.
-    pub(crate) fn get(&self, sidx: SegmentIndex) -> T {
-        self.values[sidx.index()]
+    pub(crate) fn get(&self, sidx: usize) -> T {
+        self.values[sidx]
     }
 
     /// Return a mutable slot for `sidx`, marking it for later clearing if it is
     /// currently `empty`.
-    pub(crate) fn get_mut(&mut self, sidx: SegmentIndex) -> &mut T {
-        let index = sidx.index();
+    pub(crate) fn get_mut(&mut self, sidx: usize) -> &mut T {
+        let index = sidx;
         if self.values[index] == self.empty {
             self.touched.push(sidx);
         }
@@ -95,8 +95,8 @@ impl<T: Copy + PartialEq> SegmentTable<T> {
     ///
     /// Use this when the caller already knows the slot is empty or doesn't need
     /// to know whether it changed.
-    pub(crate) fn set(&mut self, sidx: SegmentIndex, value: T) {
-        let index = sidx.index();
+    pub(crate) fn set(&mut self, sidx: usize, value: T) {
+        let index = sidx;
         if self.values[index] == self.empty {
             self.touched.push(sidx);
         }
@@ -106,8 +106,8 @@ impl<T: Copy + PartialEq> SegmentTable<T> {
     /// Set `sidx` to `value` only if it is still `empty`.
     ///
     /// Returns `true` if the slot changed. This is useful for visited sets.
-    pub(crate) fn set_if_empty(&mut self, sidx: SegmentIndex, value: T) -> bool {
-        let index = sidx.index();
+    pub(crate) fn set_if_empty(&mut self, sidx: usize, value: T) -> bool {
+        let index = sidx;
         if self.values[index] != self.empty {
             return false;
         }
@@ -117,22 +117,22 @@ impl<T: Copy + PartialEq> SegmentTable<T> {
     }
 }
 
-/// A [`SegmentTable`] that can accommodate segments inserted after construction.
+/// A [`ScratchTable`] that can accommodate segments inserted after construction.
 ///
-/// Most algorithms should prefer [`SegmentTable`] because fixed-size direct
+/// Most algorithms should prefer [`ScratchTable`] because fixed-size direct
 /// indexing makes invalid usage obvious. This wrapper is for longer-lived
-/// scratch state in post-processing, where the graph may grow while the scratch
+/// scratch state in the graph build, where the graph may grow while the scratch
 /// table is still reused. It preserves the same touched-slot clearing behavior,
 /// but grows before accessing an out-of-range segment index.
-pub(crate) struct GrowingSegmentTable<T> {
-    inner: SegmentTable<T>,
+pub(crate) struct GrowingScratchTable<T> {
+    inner: ScratchTable<T>,
 }
 
-impl<T: Copy + PartialEq> GrowingSegmentTable<T> {
+impl<T: Copy + PartialEq> GrowingScratchTable<T> {
     /// Create a growable table initially sized for the current graph `node_bound`.
     pub(crate) fn new(node_bound: usize, empty: T) -> Self {
-        GrowingSegmentTable {
-            inner: SegmentTable::new(node_bound, empty),
+        GrowingScratchTable {
+            inner: ScratchTable::new(node_bound, empty),
         }
     }
 
@@ -142,44 +142,44 @@ impl<T: Copy + PartialEq> GrowingSegmentTable<T> {
     }
 
     /// Set `sidx` to `value`, growing first if necessary.
-    pub(crate) fn set(&mut self, sidx: SegmentIndex, value: T) {
+    pub(crate) fn set(&mut self, sidx: usize, value: T) {
         self.ensure_index(sidx);
         self.inner.set(sidx, value);
     }
 
     /// Set `sidx` to `value` only if it is still `empty`, growing first if
     /// necessary.
-    pub(crate) fn set_if_empty(&mut self, sidx: SegmentIndex, value: T) -> bool {
+    pub(crate) fn set_if_empty(&mut self, sidx: usize, value: T) -> bool {
         self.ensure_index(sidx);
         self.inner.set_if_empty(sidx, value)
     }
 
     /// Ensure `sidx` is addressable by the wrapped table.
-    fn ensure_index(&mut self, sidx: SegmentIndex) {
-        let index = sidx.index();
+    fn ensure_index(&mut self, sidx: usize) {
+        let index = sidx;
         if index >= self.inner.values.len() {
             self.inner.values.resize(index + 1, self.inner.empty);
         }
     }
 }
 
-/// Reusable scratch state for repeated segment graph walks during post-processing.
+/// Reusable scratch state for repeated segment graph walks.
 ///
-/// Workspace post-processing may run many short traversals while also inserting
+/// The graph build may run many short traversals while also inserting
 /// new segments into the graph. Reusing the queue and visited table avoids
 /// allocating a fresh visited set for every walk, and the growable table keeps
-/// the scratch state valid if post-processing creates segment indices that did
-/// not exist when the scratch state was created.
+/// the scratch state valid for segment indices that did not exist when the
+/// scratch state was created.
 pub(crate) struct SegmentVisitScratch {
-    seen: GrowingSegmentTable<bool>,
-    next: VecDeque<SegmentIndex>,
+    seen: GrowingScratchTable<bool>,
+    next: VecDeque<usize>,
 }
 
 impl SegmentVisitScratch {
     /// Create scratch storage initially sized for the current graph.
     pub(crate) fn new(graph: &Graph) -> Self {
         SegmentVisitScratch {
-            seen: GrowingSegmentTable::new(graph.inner.node_bound(), false),
+            seen: GrowingScratchTable::new(graph.id_bound(), false),
             next: VecDeque::new(),
         }
     }
@@ -194,7 +194,7 @@ impl SegmentVisitScratch {
     pub(crate) fn visit_including_start_until(
         &mut self,
         graph: &Graph,
-        start: SegmentIndex,
+        start: usize,
         direction: Direction,
         mut visit_and_prune: impl FnMut(&Segment) -> bool,
     ) {
@@ -214,7 +214,7 @@ impl SegmentVisitScratch {
     pub(crate) fn visit_excluding_start_until(
         &mut self,
         graph: &Graph,
-        start: SegmentIndex,
+        start: usize,
         direction: Direction,
         mut visit_and_prune: impl FnMut(&Segment) -> bool,
     ) {
@@ -225,7 +225,7 @@ impl SegmentVisitScratch {
     fn visit_until(
         &mut self,
         graph: &Graph,
-        start: SegmentIndex,
+        start: usize,
         direction: Direction,
         include_start: bool,
         visit_and_prune: &mut impl FnMut(&Segment) -> bool,
@@ -236,7 +236,7 @@ impl SegmentVisitScratch {
 
         while let Some(next_sidx) = self.next.pop_front() {
             if (!include_start && start == next_sidx) || !visit_and_prune(&graph[next_sidx]) {
-                for neighbor in graph.inner.neighbors_directed(next_sidx, direction) {
+                for neighbor in graph.neighbors_directed(next_sidx, direction) {
                     if self.mark(neighbor) {
                         self.next.push_back(neighbor);
                     }
@@ -252,12 +252,12 @@ impl SegmentVisitScratch {
     }
 
     /// Mark `sidx` if it hasn't been seen in the current walk.
-    fn mark(&mut self, sidx: SegmentIndex) -> bool {
+    fn mark(&mut self, sidx: usize) -> bool {
         self.seen.set_if_empty(sidx, true)
     }
 
     /// Mark `sidx` when the caller already knows it hasn't been seen.
-    fn mark_known_unseen(&mut self, sidx: SegmentIndex) {
+    fn mark_known_unseen(&mut self, sidx: usize) {
         self.seen.set(sidx, true);
     }
 }

@@ -2,11 +2,10 @@ use anyhow::Context as _;
 use but_core::ref_metadata;
 
 use super::Stack;
-use crate::{Graph, SegmentIndex};
+use crate::Graph;
 
 pub(super) mod api;
 mod init;
-pub(crate) use init::Downgrade;
 
 /// A workspace reference is a list of [Stacks](Stack), with a reference to the underlying [`Graph`].
 #[derive(Clone)]
@@ -14,7 +13,7 @@ pub struct Workspace {
     /// The underlying graph for providing simplified access to data.
     pub graph: Graph,
     /// An ID which uniquely identifies the [graph segment](crate::Segment) that represents the tip of the workspace.
-    pub id: SegmentIndex,
+    pub id: usize,
     /// Specify what kind of workspace this is.
     pub kind: WorkspaceKind,
     /// One or more stacks that live in the workspace, in order of parents of the workspace commit if there are more than one.
@@ -32,7 +31,7 @@ pub struct Workspace {
     /// It is `None` there is only a single stack and no target, so nothing was integrated.
     pub lower_bound: Option<gix::ObjectId>,
     /// If `lower_bound` is set, this is the segment owning the commit.
-    pub lower_bound_segment_id: Option<SegmentIndex>,
+    pub lower_bound_segment_id: Option<usize>,
     /// The target, as identified by a remote tracking branch, to integrate workspace stacks into.
     ///
     /// If `None`, and if `target_commit` is `None`, this is a local workspace that doesn't know when
@@ -59,109 +58,62 @@ pub struct Workspace {
     pub metadata: Option<ref_metadata::Workspace>,
 }
 
-/// A copy of all workspace state, to pass it around internally.
-pub(crate) struct WorkspaceState {
-    pub id: SegmentIndex,
-    pub kind: WorkspaceKind,
-    pub stacks: Vec<Stack>,
-    pub lower_bound: Option<gix::ObjectId>,
-    pub lower_bound_segment_id: Option<SegmentIndex>,
-    pub target_ref: Option<TargetRef>,
-    pub target_commit: Option<TargetCommit>,
-    pub metadata: Option<ref_metadata::Workspace>,
-}
-
-/// Graph-level workspace facts needed while reconciling a traversed graph.
-///
-/// This deliberately stops before the final workspace projection pruning and
-/// remote-display enrichment. Reconciliation needs the workspace frame and
-/// current graph paths, not a finished [`Workspace`].
-pub(crate) struct WorkspaceReconciliationInput {
-    /// Segment that represents the workspace tip/ref being reconciled.
-    ///
-    /// In managed mode this is the workspace ref segment. Reconciliation uses
-    /// it as the root for inserting or reordering virtual stack branch
-    /// segments according to workspace metadata.
-    pub id: SegmentIndex,
-    /// Current graph paths below the workspace tip, grouped using the same
-    /// first-parent path rules as projection, but before projection-only
-    /// pruning and remote display enrichment.
-    ///
-    /// Reconciliation uses these paths to discover which already-traversed
-    /// segments can receive metadata-defined branch segments.
-    pub stacks: Vec<Stack>,
-    /// Segment that owns the computed workspace lower-bound commit, regardless
-    /// of whether that segment is currently part of [`Self::stacks`].
-    ///
-    /// This is the full frame-of-reference lower bound used to decide where
-    /// workspace stack collection stops and which base candidates are relevant.
-    /// It may point to a target/integrated segment outside the workspace paths,
-    /// unlike [`Self::lower_bound_segment_id_in_workspace()`].
-    pub lower_bound_segment_id: Option<SegmentIndex>,
-    /// Resolved target ref for the workspace, if one is available.
-    ///
-    /// Reconciliation uses the target segment to avoid creating independent
-    /// branch segments from target-side history and to identify candidates
-    /// where the target is connected from above.
-    pub target_ref: Option<TargetRef>,
-    /// Resolved target commit for the workspace, if one is available.
-    ///
-    /// This can come from workspace metadata or traversal target context. It is
-    /// used as another lower-bound/candidate anchor when reconciling branches
-    /// against the traversed graph.
-    pub target_commit: Option<TargetCommit>,
-    /// Workspace metadata that defines the desired applied/unapplied stacks,
-    /// branch order, branch names, and target settings.
-    ///
-    /// This is the non-Git input reconciliation applies to the traversed graph.
-    pub metadata: ref_metadata::Workspace,
-}
-
-impl WorkspaceReconciliationInput {
-    /// Return the lower-bound segment only if it is currently part of one of
-    /// [`Self::stacks`].
-    ///
-    /// This is narrower than [`Self::lower_bound_segment_id`]. Reconciliation
-    /// uses it for the "split lower bound out of a named stack segment" fixup,
-    /// which is only valid when that lower-bound segment is inside the current
-    /// workspace stack paths. If the lower bound comes from the target side or
-    /// another integrated context outside the workspace paths, this returns
-    /// `None` to avoid mutating unrelated graph structure.
-    pub fn lower_bound_segment_id_in_workspace(&self) -> Option<SegmentIndex> {
-        self.lower_bound_segment_id.filter(|lb_sidx| {
-            self.stacks
-                .iter()
-                .flat_map(|s| s.segments.iter().map(|s| s.id))
-                .any(|sid| sid == *lb_sidx)
-        })
-    }
-}
-
+/// Construction: the workspace-level entry points, mirroring the graph traversals. These are
+/// what operations use — the segment [`Graph`] is carried as [`Workspace::graph`], but nothing
+/// outside the crate needs to build one. (The fold: builder and projection fuse behind these.)
 impl Workspace {
-    fn from_state(
-        graph: Graph,
-        WorkspaceState {
-            id,
-            kind,
-            stacks,
-            lower_bound,
-            lower_bound_segment_id,
-            target_ref,
-            target_commit,
-            metadata,
-        }: WorkspaceState,
-    ) -> Self {
-        Workspace {
-            graph,
-            id,
-            kind,
-            stacks,
-            lower_bound,
-            lower_bound_segment_id,
-            target_ref,
-            target_commit,
-            metadata,
-        }
+    /// Build the workspace as seen from `HEAD` — the standard entry point.
+    pub fn from_head(
+        repo: &gix::Repository,
+        meta: &impl but_core::RefMetadata,
+        project_meta: but_core::ref_metadata::ProjectMeta,
+        options: crate::walk::Options,
+    ) -> anyhow::Result<Self> {
+        Graph::from_head(repo, meta, project_meta, options)?.into_workspace()
+    }
+
+    /// Build the workspace as seen from `tip` (a checkout or preview position), named by
+    /// `ref_name` if the position is checked out as a ref.
+    pub fn from_tip(
+        tip: gix::Id<'_>,
+        ref_name: impl Into<Option<gix::refs::FullName>>,
+        meta: &impl but_core::RefMetadata,
+        project_meta: but_core::ref_metadata::ProjectMeta,
+        options: crate::walk::Options,
+    ) -> anyhow::Result<Self> {
+        Graph::from_tip(tip, ref_name, meta, project_meta, options)?.into_workspace()
+    }
+
+    /// Build the workspace from multiple `tips` at once — the multi-tip variant of
+    /// [`Self::from_tip`].
+    pub fn from_seeds(
+        repo: &gix::Repository,
+        tips: impl IntoIterator<Item = crate::walk::Seed>,
+        meta: &impl but_core::RefMetadata,
+        project_meta: but_core::ref_metadata::ProjectMeta,
+        options: crate::walk::Options,
+    ) -> anyhow::Result<Self> {
+        Graph::from_seeds(repo, tips, meta, project_meta, options)?.into_workspace()
+    }
+
+    /// Re-read the world with in-memory `overlay` refs and metadata, yielding the workspace as
+    /// it would look after applying them.
+    pub fn redo(
+        &self,
+        repo: &gix::Repository,
+        meta: &impl but_core::RefMetadata,
+        overlay: crate::walk::Overlay,
+    ) -> anyhow::Result<Self> {
+        self.graph
+            .redo_traversal(repo, meta, overlay)?
+            .into_workspace()
+    }
+
+    /// Validate the carried graph's invariants (see [`Graph::validated`]), passing `self`
+    /// through for chaining — the workspace-level twin tests use after construction.
+    pub fn validated(mut self) -> anyhow::Result<Self> {
+        self.graph = self.graph.validated()?;
+        Ok(self)
     }
 }
 
@@ -230,7 +182,7 @@ pub struct TargetRef {
     /// Typically, this is `refs/remotes/origin/main`.
     pub ref_name: gix::refs::FullName,
     /// The index to the respective segment in the graph, it's the segment with [`Self::ref_name`] as name.
-    pub segment_index: SegmentIndex,
+    pub segment_index: usize,
     /// The amount of *all* commits that aren't included in any segment in the workspace, they are in its future.
     pub commits_ahead: usize,
 }
@@ -247,7 +199,7 @@ pub struct TargetCommit {
     /// the reach of the workspace.
     pub commit_id: gix::ObjectId,
     /// The index to the respective segment in the graph that contains [`Self::commit_id`].
-    pub segment_index: SegmentIndex,
+    pub segment_index: usize,
 }
 
 impl TargetCommit {
@@ -287,14 +239,9 @@ impl TargetRef {
         })
     }
 
-    fn compute_and_set_commits_ahead(
-        &mut self,
-        graph: &Graph,
-        lower_bound_segment: Option<SegmentIndex>,
-    ) {
-        let lower_bound = lower_bound_segment.map(|sidx| (sidx, graph[sidx].generation));
+    fn compute_and_set_commits_ahead(&mut self, graph: &Graph, lower_bound_segment: Option<usize>) {
         self.commits_ahead = 0;
-        Self::visit_upstream_commits(graph, self.segment_index, lower_bound, |s| {
+        Self::visit_upstream_commits(graph, self.segment_index, lower_bound_segment, |s| {
             self.commits_ahead += s.commits.len();
         })
     }

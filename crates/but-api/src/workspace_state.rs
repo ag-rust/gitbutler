@@ -42,7 +42,7 @@ impl WorkspaceState {
     ///
     /// This is the most direct constructor in this module and is the right choice when
     /// there is no need to inspect or materialize a [`SuccessfulRebase`].
-    pub(crate) fn from_workspace<M: RefMetadata>(
+    pub fn from_workspace<M: RefMetadata>(
         workspace: &but_graph::Workspace,
         meta: &mut M,
         repo: &gix::Repository,
@@ -56,7 +56,7 @@ impl WorkspaceState {
                 repo,
                 but_workspace::ref_info::Options {
                     project_meta: workspace.graph.project_meta.clone(),
-                    traversal: but_graph::init::Options::limited(),
+                    traversal: but_graph::walk::Options::limited(),
                     expensive_commit_info: true,
                     ..Default::default()
                 },
@@ -70,9 +70,8 @@ impl WorkspaceState {
         }
         #[cfg(feature = "graph-workspace")]
         {
-            let mut workspace = workspace.clone();
             let graph_workspace =
-                but_workspace::workspace::detailed_graph_workspace(&mut workspace, meta, repo)?;
+                but_workspace::workspace::detailed_graph_workspace(workspace, meta, repo)?;
 
             Ok(WorkspaceState {
                 replaced_commits,
@@ -90,24 +89,33 @@ impl WorkspaceState {
     /// The `replaced_commits` map should describe the commit rewrites visible in the
     /// preview graph, which typically comes from `rebase.history.commit_mappings()`.
     pub fn from_rebase_preview<M: RefMetadata>(
-        rebase: &mut SuccessfulRebase<'_, '_, M>,
+        workspace: &but_graph::Workspace,
+        rebase: &mut SuccessfulRebase<'_, M>,
         replaced_commits: BTreeMap<gix::ObjectId, gix::ObjectId>,
     ) -> anyhow::Result<WorkspaceState> {
-        let workspace = rebase.overlayed_graph()?.into_workspace()?;
+        let overlay = rebase.rebase_overlay()?;
         let (repo, meta) = rebase.repo_and_meta_mut();
-        Self::from_workspace(&workspace, meta, repo, replaced_commits)
+        let preview = workspace.redo(repo, meta, overlay)?;
+        Self::from_workspace(&preview, meta, repo, replaced_commits)
     }
 
-    /// Build a [`WorkspaceState`] from an already-materialized rebase.
+    /// Build a [`WorkspaceState`] from an already-materialized rebase, refreshing `workspace`
+    /// from the rebase's mutated commit graph along the way.
     ///
     /// Use this when the caller needs to perform additional bookkeeping after materialization
     /// before constructing the final workspace state.
     pub fn from_materialized_rebase<M: RefMetadata>(
-        materialized: MaterializeOutcome<'_, '_, M>,
+        workspace: &mut but_graph::Workspace,
+        materialized: MaterializeOutcome<'_, M>,
         repo: &gix::Repository,
     ) -> anyhow::Result<WorkspaceState> {
+        workspace.refresh_from_commit_graph(
+            materialized.arena().clone(),
+            repo,
+            materialized.meta,
+        )?;
         Self::from_workspace(
-            materialized.workspace,
+            workspace,
             materialized.meta,
             repo,
             materialized.history.commit_mappings(),
@@ -123,22 +131,18 @@ impl WorkspaceState {
     /// workspace state together with the final commit-replacement mappings returned by the
     /// materialized history.
     pub fn from_successful_rebase<M: RefMetadata>(
-        rebase: SuccessfulRebase<'_, '_, M>,
+        workspace: &mut but_graph::Workspace,
+        rebase: SuccessfulRebase<'_, M>,
         repo: &gix::Repository,
         dry_run: DryRun,
     ) -> anyhow::Result<WorkspaceState> {
         if dry_run.into() {
             let mut rebase = rebase;
             let replaced_commits = rebase.history.commit_mappings();
-            return Self::from_rebase_preview(&mut rebase, replaced_commits);
+            return Self::from_rebase_preview(workspace, &mut rebase, replaced_commits);
         }
 
         let materialized = rebase.materialize()?;
-        Self::from_workspace(
-            materialized.workspace,
-            materialized.meta,
-            repo,
-            materialized.history.commit_mappings(),
-        )
+        Self::from_materialized_rebase(workspace, materialized, repo)
     }
 }

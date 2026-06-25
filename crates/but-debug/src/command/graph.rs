@@ -50,7 +50,7 @@ pub(crate) fn run(
         .map(|rev_spec| repo.rev_parse_single(rev_spec))
         .transpose()?
         .map(|id| id.detach());
-    let opts = but_graph::init::Options {
+    let opts = but_graph::walk::Options {
         extra_target_commit_id: extra_target,
         collect_tags: true,
         hard_limit: graph_args.hard_limit,
@@ -69,11 +69,10 @@ pub(crate) fn run(
                     .expect("the prefix is unambiguous")
             })
             .collect(),
-        dangerously_skip_postprocessing_for_debugging: graph_args.no_post,
     };
 
-    let graph = match graph_args.ref_name.as_deref() {
-        None => but_graph::Graph::from_head(
+    let workspace = match graph_args.ref_name.as_deref() {
+        None => but_graph::Workspace::from_head(
             &repo,
             &meta,
             but_core::ref_metadata::ProjectMeta::default(),
@@ -82,7 +81,7 @@ pub(crate) fn run(
         Some(ref_name) => {
             let mut reference = repo.find_reference(ref_name)?;
             let id = reference.peel_to_id()?;
-            but_graph::Graph::from_commit_traversal(
+            but_graph::Workspace::from_tip(
                 id,
                 reference.name().to_owned(),
                 &meta,
@@ -92,7 +91,6 @@ pub(crate) fn run(
         }
     }?;
 
-    let workspace = graph.into_workspace()?;
     emit_workspace(&workspace, graph_args, out, err)
 }
 
@@ -156,7 +154,6 @@ fn emit_workspace(
 /// must be passed directly into `but_graph::Graph::from_*`.
 fn uses_context_discovery(graph_args: &GraphArgs) -> bool {
     graph_args.extra_target.is_none()
-        && !graph_args.no_post
         && graph_args.hard_limit.is_none()
         && graph_args.limit == Some(Some(300))
         && graph_args.limit_extension.is_empty()

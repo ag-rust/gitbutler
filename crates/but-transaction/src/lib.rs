@@ -114,11 +114,12 @@ where
 
         let db_tx = db.transaction()?;
 
-        let editor = Editor::create(&mut ws, meta, &repo)?;
+        let editor = Editor::create(ws.graph.commit_graph(), &ws.graph.project_meta, meta, &repo)?;
         let rebase = editor.rebase()?;
 
         let mut inner = Inner {
             rebase: Some(rebase),
+            workspace: ws.clone(),
             db_tx,
             commit_mappings: CommitMappings::default(),
             pending_metadata_removals: Vec::new(),
@@ -143,6 +144,7 @@ where
 
         let Inner {
             mut rebase,
+            workspace: _,
             db_tx,
             commit_mappings: _,
             pending_metadata_removals,
@@ -156,6 +158,7 @@ where
         let should_rollback = callback_outcome.should_rollback();
         let outcome = callback_outcome.maybe_commit(
             &repo,
+            &mut ws,
             rebase,
             db_tx,
             pending_metadata_removals,
@@ -206,7 +209,9 @@ where
 {
     // an Option so we can "take" the rebase, convert it into an editor, perform another rebase,
     // and put the result back.
-    rebase: Option<SuccessfulRebase<'rebase, 'rebase, M>>,
+    rebase: Option<SuccessfulRebase<'rebase, M>>,
+    // The workspace the transaction started from, used as the base for overlay previews.
+    workspace: but_graph::Workspace,
     db_tx: but_db::Transaction<'rebase>,
     pending_metadata_removals: Vec<FullName>,
     pending_metadata_updates: Vec<PendingMetadataUpdate>,
@@ -325,8 +330,14 @@ where
         source_branch: &FullNameRef,
         target_branch: &FullNameRef,
     ) -> anyhow::Result<()> {
+        let workspace = self.inner.workspace.clone();
         let ws_meta = self.rebase(|editor, _, _| {
-            let outcome = but_workspace::branch::move_branch(editor, source_branch, target_branch)?;
+            let outcome = but_workspace::branch::move_branch(
+                editor,
+                &workspace,
+                source_branch,
+                target_branch,
+            )?;
             Ok((outcome.ws_meta, outcome.rebase))
         })?;
 
@@ -336,8 +347,10 @@ where
     }
 
     pub fn tear_off_branch(&mut self, source_branch: &FullNameRef) -> anyhow::Result<()> {
+        let workspace = self.inner.workspace.clone();
         let ws_meta = self.rebase(|editor, _, _| {
-            let outcome = but_workspace::branch::tear_off_branch(editor, source_branch, None)?;
+            let outcome =
+                but_workspace::branch::tear_off_branch(editor, &workspace, source_branch, None)?;
             Ok((outcome.ws_meta, outcome.rebase))
         })?;
 
@@ -354,13 +367,13 @@ where
             return Ok(());
         };
 
-        let workspace = self
-            .inner
-            .rebase
-            .as_ref()
-            .expect("rebase is always Some(_)")
-            .overlayed_graph()?
-            .into_workspace()?;
+        let workspace = but_workspace::workspace::overlayed_workspace(
+            &self.inner.workspace,
+            self.inner
+                .rebase
+                .as_ref()
+                .expect("rebase is always Some(_)"),
+        )?;
 
         let ref_name = workspace
             .ref_name()
@@ -395,13 +408,13 @@ where
             .try_find_reference(ref_name)?
             .map(|reference| reference.target().into());
 
-        let graph = self
-            .inner
-            .rebase
-            .as_ref()
-            .expect("rebase is always Some(_)")
-            .overlayed_graph()?;
-        let workspace = graph.into_workspace()?;
+        let workspace = but_workspace::workspace::overlayed_workspace(
+            &self.inner.workspace,
+            self.inner
+                .rebase
+                .as_ref()
+                .expect("rebase is always Some(_)"),
+        )?;
         let (anchor, anchor_segment_oldest_commit_id) = match anchor {
             Some(but_workspace::branch::create_reference::Anchor::AtSegment {
                 ref_name,
@@ -551,7 +564,7 @@ where
                 | None => {
                     let target = editor.select_commit(target_id)?;
                     let reference = editor.add_step(reference)?;
-                    editor.add_edge(reference, target, 0)?;
+                    editor.insert_edge(reference, target, 0)?;
                 }
             }
             Ok(((), editor.rebase()?))
@@ -726,10 +739,10 @@ where
     fn rebase<F, T>(&mut self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(
-            Editor<'rebase, 'rebase, M>,
+            Editor<'rebase, M>,
             &CommitMappings,
             &mut but_db::Transaction<'rebase>,
-        ) -> anyhow::Result<(T, SuccessfulRebase<'rebase, 'rebase, M>)>,
+        ) -> anyhow::Result<(T, SuccessfulRebase<'rebase, M>)>,
     {
         let editor = self
             .inner
@@ -967,7 +980,8 @@ pub trait TransactionOutcome: sealed::Sealed {
     fn maybe_commit<M: RefMetadata>(
         self,
         repo: &gix::Repository,
-        rebase: SuccessfulRebase<'_, '_, M>,
+        workspace: &mut but_graph::Workspace,
+        rebase: SuccessfulRebase<'_, M>,
         db_tx: but_db::Transaction<'_>,
         pending_metadata_removals: Vec<FullName>,
         pending_metadata_updates: Vec<PendingMetadataUpdate>,
@@ -987,7 +1001,8 @@ impl TransactionOutcome for () {
     fn maybe_commit<M: RefMetadata>(
         self,
         repo: &gix::Repository,
-        rebase: SuccessfulRebase<'_, '_, M>,
+        workspace: &mut but_graph::Workspace,
+        rebase: SuccessfulRebase<'_, M>,
         db_tx: but_db::Transaction<'_>,
         pending_metadata_removals: Vec<FullName>,
         pending_metadata_updates: Vec<PendingMetadataUpdate>,
@@ -997,6 +1012,7 @@ impl TransactionOutcome for () {
         let ws = workspace_state_from_rebase(
             rebase,
             repo,
+            workspace,
             pending_metadata_removals,
             pending_metadata_updates,
             pending_created_independent_refs,
@@ -1024,7 +1040,8 @@ impl<T> TransactionOutcome for Rollback<T> {
     fn maybe_commit<M: RefMetadata>(
         self,
         _repo: &gix::Repository,
-        _rebase: SuccessfulRebase<'_, '_, M>,
+        _workspace: &mut but_graph::Workspace,
+        _rebase: SuccessfulRebase<'_, M>,
         _db_tx: but_db::Transaction<'_>,
         _pending_metadata_removals: Vec<FullName>,
         _pending_metadata_updates: Vec<PendingMetadataUpdate>,
@@ -1050,7 +1067,8 @@ impl<T> TransactionOutcome for Commit<T> {
     fn maybe_commit<M: RefMetadata>(
         self,
         repo: &gix::Repository,
-        rebase: SuccessfulRebase<'_, '_, M>,
+        workspace: &mut but_graph::Workspace,
+        rebase: SuccessfulRebase<'_, M>,
         db_tx: but_db::Transaction<'_>,
         pending_metadata_removals: Vec<FullName>,
         pending_metadata_updates: Vec<PendingMetadataUpdate>,
@@ -1060,6 +1078,7 @@ impl<T> TransactionOutcome for Commit<T> {
         let workspace = workspace_state_from_rebase(
             rebase,
             repo,
+            workspace,
             pending_metadata_removals,
             pending_metadata_updates,
             pending_created_independent_refs,
@@ -1090,7 +1109,8 @@ impl<T, K> TransactionOutcome for DynamicOutcome<T, K> {
     fn maybe_commit<M: RefMetadata>(
         self,
         repo: &gix::Repository,
-        rebase: SuccessfulRebase<'_, '_, M>,
+        workspace: &mut but_graph::Workspace,
+        rebase: SuccessfulRebase<'_, M>,
         db_tx: but_db::Transaction<'_>,
         pending_metadata_removals: Vec<FullName>,
         pending_metadata_updates: Vec<PendingMetadataUpdate>,
@@ -1102,6 +1122,7 @@ impl<T, K> TransactionOutcome for DynamicOutcome<T, K> {
                 let workspace = workspace_state_from_rebase(
                     rebase,
                     repo,
+                    workspace,
                     pending_metadata_removals,
                     pending_metadata_updates,
                     pending_created_independent_refs,
@@ -1118,21 +1139,22 @@ impl<T, K> TransactionOutcome for DynamicOutcome<T, K> {
 }
 
 fn workspace_state_from_rebase<M: RefMetadata>(
-    rebase: SuccessfulRebase<'_, '_, M>,
+    rebase: SuccessfulRebase<'_, M>,
     repo: &gix::Repository,
+    workspace: &mut but_graph::Workspace,
     pending_metadata_removals: Vec<FullName>,
     pending_metadata_updates: Vec<PendingMetadataUpdate>,
     pending_created_independent_refs: Vec<PendingCreatedIndependentRef>,
     dry_run: DryRun,
 ) -> anyhow::Result<WorkspaceState> {
     if dry_run.into() {
-        return WorkspaceState::from_successful_rebase(rebase, repo, dry_run);
+        return WorkspaceState::from_successful_rebase(workspace, rebase, repo, dry_run);
     }
 
     let materialized = rebase.materialize()?;
+    workspace.refresh_from_commit_graph(materialized.arena().clone(), repo, materialized.meta)?;
     for branch in pending_created_independent_refs {
-        if materialized
-            .workspace
+        if workspace
             .find_segment_and_stack_by_refname(branch.name.as_ref())
             .is_some()
         {
@@ -1140,7 +1162,7 @@ fn workspace_state_from_rebase<M: RefMetadata>(
         }
         let outcome = but_workspace::branch::apply(
             branch.name.as_ref(),
-            materialized.workspace.clone(),
+            workspace.clone(),
             repo,
             materialized.meta,
             but_workspace::branch::apply::Options {
@@ -1148,7 +1170,7 @@ fn workspace_state_from_rebase<M: RefMetadata>(
                 ..Default::default()
             },
         )?;
-        *materialized.workspace = outcome.workspace;
+        *workspace = outcome.workspace;
     }
     for update in pending_metadata_updates {
         match update {
@@ -1168,7 +1190,12 @@ fn workspace_state_from_rebase<M: RefMetadata>(
         materialized.meta.remove(ref_name.as_ref())?;
     }
 
-    WorkspaceState::from_materialized_rebase(materialized, repo)
+    WorkspaceState::from_workspace(
+        workspace,
+        materialized.meta,
+        repo,
+        materialized.history.commit_mappings(),
+    )
 }
 
 /// Intermediate outcome after creating a commit.

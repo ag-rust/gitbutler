@@ -1,9 +1,9 @@
 //! These tests exercise the disconnect operation.
-use snapbox::IntoData;
+use snapbox::prelude::*;
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use but_graph::Graph;
+use but_graph::Workspace;
 use but_rebase::graph_rebase::{Editor, Step, mutate};
 use but_testsupport::{git_status, graph_tree, visualize_commit_graph_all};
 use gix::prelude::ObjectIdExt;
@@ -26,27 +26,31 @@ fn disconnect_and_remove_middle_commit_in_linear_history() -> Result<()> {
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let b = repo.rev_parse_single("HEAD~")?.detach();
     let b_selector = editor
         .select_commit(b)
         .context("Failed to find commit b in editor graph")?;
 
-    let target = mutate::SegmentDelimiter {
+    let target = mutate::StepRange {
         child: b_selector,
         parent: b_selector,
     };
 
-    editor.disconnect_segment_from(
+    editor.disconnect_range_from(
         target,
         mutate::SelectorSet::All,
         mutate::SelectorSet::All,
@@ -55,20 +59,26 @@ fn disconnect_and_remove_middle_commit_in_linear_history() -> Result<()> {
     editor.replace(b_selector, Step::None)?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:main[🌳]
-    ├── ·b4fd8ee (⌂|1)
-    ├── ·d591dfe (⌂|1)
-    └── 🏁·35b8235 (⌂|1)
+    ├── ·b4fd8ee (⌂)
+    ├── ·d591dfe (⌂)
+    └── 🏁·35b8235 (⌂)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -100,15 +110,19 @@ fn disconnect_and_remove_two_middle_commits_in_linear_history() -> Result<()> {
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let b = repo.rev_parse_single("HEAD~")?.detach();
     let b_selector = editor
@@ -119,13 +133,13 @@ fn disconnect_and_remove_two_middle_commits_in_linear_history() -> Result<()> {
         .select_commit(a)
         .context("Failed to find commit a in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: b_selector,
         parent: a_selector,
     };
 
-    editor.disconnect_segment_from(
-        delimiter,
+    editor.disconnect_range_from(
+        range,
         mutate::SelectorSet::All,
         mutate::SelectorSet::All,
         false,
@@ -134,19 +148,25 @@ fn disconnect_and_remove_two_middle_commits_in_linear_history() -> Result<()> {
     editor.replace(a_selector, Step::None)?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:main[🌳]
-    ├── ·19f8134 (⌂|1)
-    └── 🏁·35b8235 (⌂|1)
+    ├── ·19f8134 (⌂)
+    └── 🏁·35b8235 (⌂)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -181,28 +201,32 @@ fn disconnect_and_remove_commit_in_merge_history_rewires_children() -> Result<()
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let a = repo.rev_parse_single("A")?.detach();
     let a_selector = editor
         .select_commit(a)
         .context("Failed to find commit a in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: a_selector,
         parent: a_selector,
     };
 
-    editor.disconnect_segment_from(
-        delimiter,
+    editor.disconnect_range_from(
+        range,
         mutate::SelectorSet::All,
         mutate::SelectorSet::All,
         false,
@@ -210,25 +234,31 @@ fn disconnect_and_remove_commit_in_merge_history_rewires_children() -> Result<()
     editor.replace(a_selector, Step::None)?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:with-inner-merge[🌳]
-    └── ·4023659 (⌂|1)
+    └── ·4023659 (⌂)
         └── ►:1[1]:anon:
-            └── ·01c4df0 (⌂|1)
-                ├── ►:2[3]:anon:
-                │   └── 🏁·8f0d338 (⌂|1) ►A, ►main, ►tags/base
-                └── ►:3[2]:B
-                    └── ·984fd1c (⌂|1)
-                        └── →:2:
+            └── ·01c4df0 (⌂)
+                ├── ►:3[3]:anon:
+                │   └── 🏁·8f0d338 (⌂) ►A, ►main, ►tags/base
+                └── ►:2[2]:B
+                    └── ·984fd1c (⌂)
+                        └── →:3:
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     let a_now = repo.rev_parse_single("A")?.detach();
     let base = repo.rev_parse_single("base")?.detach();
@@ -276,28 +306,32 @@ fn disconnect_and_remove_merge_with_two_parents_and_two_children() -> Result<()>
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let merge = repo.rev_parse_single("M")?.detach();
     let merge_selector = editor
         .select_commit(merge)
         .context("Failed to find merge commit M in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: merge_selector,
         parent: merge_selector,
     };
 
-    editor.disconnect_segment_from(
-        delimiter,
+    editor.disconnect_range_from(
+        range,
         mutate::SelectorSet::All,
         mutate::SelectorSet::All,
         false,
@@ -305,31 +339,37 @@ fn disconnect_and_remove_merge_with_two_parents_and_two_children() -> Result<()>
     editor.replace(merge_selector, Step::None)?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:with-two-children[🌳]
-    └── ·87269f1 (⌂|1)
+    └── ·87269f1 (⌂)
         ├── ►:1[1]:C1
-        │   └── ·3e50be4 (⌂|1)
-        │       ├── ►:3[2]:anon:
-        │       │   └── ·bc0e772 (⌂|1) ►M, ►P1
+        │   └── ·3e50be4 (⌂)
+        │       ├── ►:4[2]:anon:
+        │       │   └── ·bc0e772 (⌂) ►M, ►P1
         │       │       └── ►:5[3]:main
-        │       │           └── 🏁·7674a5e (⌂|1) ►tags/base
-        │       └── ►:4[2]:P2
-        │           └── ·392a8f8 (⌂|1)
+        │       │           └── 🏁·7674a5e (⌂) ►tags/base
+        │       └── ►:3[2]:P2
+        │           └── ·392a8f8 (⌂)
         │               └── →:5: (main)
         └── ►:2[1]:C2
-            └── ·c291781 (⌂|1)
-                ├── →:3:
-                └── →:4: (P2)
+            └── ·c291781 (⌂)
+                ├── →:4:
+                └── →:3: (P2)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     let p1 = repo.rev_parse_single("P1")?.detach();
     let p2 = repo.rev_parse_single("P2")?.detach();
@@ -410,15 +450,19 @@ fn disconnect_and_remove_merge_with_two_parents_and_two_children_from_one_side()
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let merge = repo.rev_parse_single("M")?.detach();
     let m_reference = "refs/heads/M".try_into()?;
@@ -437,44 +481,50 @@ fn disconnect_and_remove_merge_with_two_parents_and_two_children_from_one_side()
         .select_reference(parent_one)
         .context("Failed to find P1 reference in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: m_reference_selector,
         parent: merge_commit_selector,
     };
 
-    editor.disconnect_segment_from(
-        delimiter,
+    editor.disconnect_range_from(
+        range,
         mutate::SelectorSet::Some(mutate::SomeSelectors::new(vec![child_one_selector])?),
         mutate::SelectorSet::Some(mutate::SomeSelectors::new(vec![parent_one_selector])?),
         false,
     )?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:with-two-children[🌳]
-    └── ·9de031b (⌂|1)
-        ├── ►:1[1]:C1
-        │   └── ·54d0b0d (⌂|1)
-        │       └── ►:3[2]:P1
-        │           └── ·bc0e772 (⌂|1)
-        │               └── ►:5[4]:main
-        │                   └── 🏁·7674a5e (⌂|1) ►tags/base
-        └── ►:2[1]:C2
-            └── ·41cb528 (⌂|1)
-                └── ►:4[2]:M
-                    └── ·9f6b11a (⌂|1)
-                        └── ►:6[3]:P2
-                            └── ·392a8f8 (⌂|1)
-                                └── →:5: (main)
+    └── ·9de031b (⌂)
+        ├── ►:2[1]:C1
+        │   └── ·54d0b0d (⌂)
+        │       └── ►:5[2]:P1
+        │           └── ·bc0e772 (⌂)
+        │               └── ►:6[4]:main
+        │                   └── 🏁·7674a5e (⌂) ►tags/base
+        └── ►:1[1]:C2
+            └── ·41cb528 (⌂)
+                └── ►:3[2]:M
+                    └── ·9f6b11a (⌂)
+                        └── ►:4[3]:P2
+                            └── ·392a8f8 (⌂)
+                                └── →:6: (main)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     let p1 = repo.rev_parse_single("P1")?.detach();
     let m = repo.rev_parse_single("M")?.detach();
@@ -551,15 +601,19 @@ fn disconnect_remove_merge_with_two_parents_and_two_children_children_only() -> 
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let merge = repo.rev_parse_single("M")?.detach();
     let m_reference = "refs/heads/M".try_into()?;
@@ -574,42 +628,48 @@ fn disconnect_remove_merge_with_two_parents_and_two_children_children_only() -> 
         .select_reference(parent_one)
         .context("Failed to find P1 reference in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: m_reference_selector,
         parent: merge_commit_selector,
     };
 
-    editor.disconnect_segment_from(
-        delimiter,
+    editor.disconnect_range_from(
+        range,
         mutate::SelectorSet::None,
         mutate::SelectorSet::Some(mutate::SomeSelectors::new(vec![parent_one_selector])?),
         false,
     )?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:with-two-children[🌳]
-    └── ·b87b6c9 (⌂|1)
-        ├── ►:1[1]:C1
-        │   └── ·76ecfed (⌂|1)
+    └── ·b87b6c9 (⌂)
+        ├── ►:2[1]:C1
+        │   └── ·76ecfed (⌂)
         │       └── ►:3[2]:M
-        │           └── ·9f6b11a (⌂|1)
+        │           └── ·9f6b11a (⌂)
         │               └── ►:4[3]:P2
-        │                   └── ·392a8f8 (⌂|1)
+        │                   └── ·392a8f8 (⌂)
         │                       └── ►:5[4]:main
-        │                           └── 🏁·7674a5e (⌂|1) ►tags/base
-        └── ►:2[1]:C2
-            └── ·41cb528 (⌂|1)
+        │                           └── 🏁·7674a5e (⌂) ►tags/base
+        └── ►:1[1]:C2
+            └── ·41cb528 (⌂)
                 └── →:3: (M)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     let p1 = repo.rev_parse_single("P1")?.detach();
     let p2 = repo.rev_parse_single("P2")?.detach();
@@ -694,15 +754,19 @@ fn disconnect_fails_when_parents_to_disconnect_is_none() -> Result<()> {
 
     let before = visualize_commit_graph_all(&repo)?;
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let merge = repo.rev_parse_single("M")?.detach();
     let m_reference = "refs/heads/M".try_into()?;
@@ -717,14 +781,14 @@ fn disconnect_fails_when_parents_to_disconnect_is_none() -> Result<()> {
         .select_commit(child_one)
         .context("Failed to find C1 referent in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: m_reference_selector,
         parent: merge_commit_selector,
     };
 
     let err = editor
-        .disconnect_segment_from(
-            delimiter,
+        .disconnect_range_from(
+            range,
             mutate::SelectorSet::Some(mutate::SomeSelectors::new(vec![child_one_selector])?),
             mutate::SelectorSet::None,
             false,
@@ -737,32 +801,38 @@ fn disconnect_fails_when_parents_to_disconnect_is_none() -> Result<()> {
     );
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:with-two-children[🌳]
-    └── ·d1cc4c7 (⌂|1)
-        ├── ►:1[1]:C1
-        │   └── ·f94f259 (⌂|1)
+    └── ·d1cc4c7 (⌂)
+        ├── ►:2[1]:C1
+        │   └── ·f94f259 (⌂)
         │       └── ►:3[2]:M
-        │           └── ·c5d1178 (⌂|1)
-        │               ├── ►:4[3]:P1
-        │               │   └── ·bc0e772 (⌂|1)
+        │           └── ·c5d1178 (⌂)
+        │               ├── ►:5[3]:P1
+        │               │   └── ·bc0e772 (⌂)
         │               │       └── ►:6[4]:main
-        │               │           └── 🏁·7674a5e (⌂|1) ►tags/base
-        │               └── ►:5[3]:P2
-        │                   └── ·392a8f8 (⌂|1)
+        │               │           └── 🏁·7674a5e (⌂) ►tags/base
+        │               └── ►:4[3]:P2
+        │                   └── ·392a8f8 (⌂)
         │                       └── →:6: (main)
-        └── ►:2[1]:C2
-            └── ·ce6aca9 (⌂|1)
+        └── ►:1[1]:C2
+            └── ·ce6aca9 (⌂)
                 └── →:3: (M)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     let after = visualize_commit_graph_all(&repo)?;
     assert_eq!(before, after, "graph should remain unchanged on failure");
@@ -776,15 +846,19 @@ fn disconnect_fails_fast_if_parent_to_disconnect_is_not_direct_parent() -> Resul
 
     let before = visualize_commit_graph_all(&repo)?;
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let merge = repo.rev_parse_single("M")?.detach();
     let m_reference = "refs/heads/M".try_into()?;
@@ -799,14 +873,14 @@ fn disconnect_fails_fast_if_parent_to_disconnect_is_not_direct_parent() -> Resul
         .select_commit(child_one)
         .context("Failed to find C1 referent in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: m_reference_selector,
         parent: merge_commit_selector,
     };
 
     let err = editor
-        .disconnect_segment_from(
-            delimiter,
+        .disconnect_range_from(
+            range,
             mutate::SelectorSet::Some(mutate::SomeSelectors::new(vec![child_one_selector])?),
             mutate::SelectorSet::Some(mutate::SomeSelectors::new(vec![child_one_selector])?),
             false,
@@ -819,32 +893,38 @@ fn disconnect_fails_fast_if_parent_to_disconnect_is_not_direct_parent() -> Resul
     );
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:with-two-children[🌳]
-    └── ·d1cc4c7 (⌂|1)
-        ├── ►:1[1]:C1
-        │   └── ·f94f259 (⌂|1)
+    └── ·d1cc4c7 (⌂)
+        ├── ►:2[1]:C1
+        │   └── ·f94f259 (⌂)
         │       └── ►:3[2]:M
-        │           └── ·c5d1178 (⌂|1)
-        │               ├── ►:4[3]:P1
-        │               │   └── ·bc0e772 (⌂|1)
+        │           └── ·c5d1178 (⌂)
+        │               ├── ►:5[3]:P1
+        │               │   └── ·bc0e772 (⌂)
         │               │       └── ►:6[4]:main
-        │               │           └── 🏁·7674a5e (⌂|1) ►tags/base
-        │               └── ►:5[3]:P2
-        │                   └── ·392a8f8 (⌂|1)
+        │               │           └── 🏁·7674a5e (⌂) ►tags/base
+        │               └── ►:4[3]:P2
+        │                   └── ·392a8f8 (⌂)
         │                       └── →:6: (main)
-        └── ►:2[1]:C2
-            └── ·ce6aca9 (⌂|1)
+        └── ►:1[1]:C2
+            └── ·ce6aca9 (⌂)
                 └── →:3: (M)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     let after = visualize_commit_graph_all(&repo)?;
     assert_eq!(before, after, "graph should remain unchanged on failure");
@@ -858,15 +938,19 @@ fn disconnect_fails_fast_if_child_to_disconnect_is_not_direct_child() -> Result<
 
     let before = visualize_commit_graph_all(&repo)?;
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let merge = repo.rev_parse_single("M")?.detach();
     let m_reference = "refs/heads/M".try_into()?;
@@ -881,14 +965,14 @@ fn disconnect_fails_fast_if_child_to_disconnect_is_not_direct_child() -> Result<
         .select_reference(parent_one)
         .context("Failed to find P1 reference in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: m_reference_selector,
         parent: merge_commit_selector,
     };
 
     let err = editor
-        .disconnect_segment_from(
-            delimiter,
+        .disconnect_range_from(
+            range,
             mutate::SelectorSet::Some(mutate::SomeSelectors::new(vec![parent_one_selector])?),
             mutate::SelectorSet::Some(mutate::SomeSelectors::new(vec![parent_one_selector])?),
             false,
@@ -901,32 +985,38 @@ fn disconnect_fails_fast_if_child_to_disconnect_is_not_direct_child() -> Result<
     );
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:with-two-children[🌳]
-    └── ·d1cc4c7 (⌂|1)
-        ├── ►:1[1]:C1
-        │   └── ·f94f259 (⌂|1)
+    └── ·d1cc4c7 (⌂)
+        ├── ►:2[1]:C1
+        │   └── ·f94f259 (⌂)
         │       └── ►:3[2]:M
-        │           └── ·c5d1178 (⌂|1)
-        │               ├── ►:4[3]:P1
-        │               │   └── ·bc0e772 (⌂|1)
+        │           └── ·c5d1178 (⌂)
+        │               ├── ►:5[3]:P1
+        │               │   └── ·bc0e772 (⌂)
         │               │       └── ►:6[4]:main
-        │               │           └── 🏁·7674a5e (⌂|1) ►tags/base
-        │               └── ►:5[3]:P2
-        │                   └── ·392a8f8 (⌂|1)
+        │               │           └── 🏁·7674a5e (⌂) ►tags/base
+        │               └── ►:4[3]:P2
+        │                   └── ·392a8f8 (⌂)
         │                       └── →:6: (main)
-        └── ►:2[1]:C2
-            └── ·ce6aca9 (⌂|1)
+        └── ►:1[1]:C2
+            └── ·ce6aca9 (⌂)
                 └── →:3: (M)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     let after = visualize_commit_graph_all(&repo)?;
     assert_eq!(before, after, "graph should remain unchanged on failure");

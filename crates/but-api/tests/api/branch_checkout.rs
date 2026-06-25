@@ -103,7 +103,7 @@ RefInfo {
             ),
             segments: [
                 ref_info::ui::Segment {
-                    id: NodeIndex(0),
+                    id: 0,
                     ref_name: "►feature[🌳]",
                     remote_tracking_ref_name: "None",
                     commits: [
@@ -123,18 +123,18 @@ RefInfo {
             ref_name: FullName(
                 "refs/remotes/origin/main",
             ),
-            segment_index: NodeIndex(2),
+            segment_index: 2,
             commits_ahead: 0,
         },
     ),
     target_commit: Some(
         TargetCommit {
             commit_id: Sha1(5374caf21933aee76b72bad8d6e30949c7a30e04),
-            segment_index: NodeIndex(1),
+            segment_index: 1,
         },
     ),
     lower_bound: Some(
-        NodeIndex(1),
+        Sha1(5374caf21933aee76b72bad8d6e30949c7a30e04),
     ),
     is_managed_ref: false,
     is_managed_commit: false,
@@ -183,12 +183,12 @@ fn checkout_new_returns_head_info_matching_fresh_head_info() -> anyhow::Result<(
 
     snapbox::assert_data_eq!(
         crate::support::workspace_graph(&ctx)?,
-        snapbox::str![[r"
-⌂:0:new-branch[🌳] <> ✓refs/remotes/origin/main on 5374caf
-└── ≡:0:new-branch[🌳] {1}
-    └── :0:new-branch[🌳]
+        snapbox::str![[r#"
+⌂:2:new-branch[🌳] <> ✓refs/remotes/origin/main on 5374caf
+└── ≡:2:new-branch[🌳] on 5374caf {1}
+    └── :2:new-branch[🌳]
 
-"]]
+"#]]
     );
 
     #[cfg(feature = "graph-workspace")]
@@ -238,10 +238,12 @@ RefInfo {
             id: Some(
                 00000000-0000-0000-0000-000000000001,
             ),
-            base: None,
+            base: Some(
+                Sha1(5374caf21933aee76b72bad8d6e30949c7a30e04),
+            ),
             segments: [
                 ref_info::ui::Segment {
-                    id: NodeIndex(0),
+                    id: 2,
                     ref_name: "►new-branch[🌳]",
                     remote_tracking_ref_name: "None",
                     commits: [],
@@ -249,7 +251,7 @@ RefInfo {
                     commits_outside: None,
                     metadata: "None",
                     push_status: CompletelyUnpushed,
-                    base: "None",
+                    base: "5374caf",
                 },
             ],
         },
@@ -259,18 +261,18 @@ RefInfo {
             ref_name: FullName(
                 "refs/remotes/origin/main",
             ),
-            segment_index: NodeIndex(1),
+            segment_index: 1,
             commits_ahead: 0,
         },
     ),
     target_commit: Some(
         TargetCommit {
             commit_id: Sha1(5374caf21933aee76b72bad8d6e30949c7a30e04),
-            segment_index: NodeIndex(0),
+            segment_index: 0,
         },
     ),
     lower_bound: Some(
-        NodeIndex(0),
+        Sha1(5374caf21933aee76b72bad8d6e30949c7a30e04),
     ),
     is_managed_ref: false,
     is_managed_commit: false,

@@ -43,7 +43,7 @@ pub fn head_info(ctx: &but_ctx::Context) -> Result<but_workspace::RefInfo> {
         &meta,
         but_workspace::ref_info::Options {
             project_meta: ctx.project_meta()?,
-            traversal: but_graph::init::Options::limited(),
+            traversal: but_graph::walk::Options::limited(),
             expensive_commit_info: true,
             gerrit_mode,
         },
@@ -103,9 +103,9 @@ pub fn show_graph_svg(ctx: &Context) -> Result<()> {
         &repo,
         &meta,
         ctx.project_meta()?,
-        but_graph::init::Options {
+        but_graph::walk::Options {
             collect_tags: true,
-            ..but_graph::init::Options::limited()
+            ..but_graph::walk::Options::limited()
         },
     )?;
     graph.open_as_svg();
@@ -296,8 +296,13 @@ pub fn stash_into_branch(
 
     let outcome = {
         let mut meta = ctx.meta()?;
-        let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
-        let editor = Editor::create(&mut ws, &mut meta, &repo)?;
+        let (repo, ws, _) = ctx.workspace_mut_and_db_with_perm(perm)?;
+        let editor = Editor::create(
+            ws.graph.commit_graph(),
+            &ws.graph.project_meta,
+            &mut meta,
+            &repo,
+        )?;
         let but_workspace::commit::CommitCreateOutcome {
             rebase,
             commit_selector,
@@ -405,7 +410,7 @@ pub fn workspace_branch_and_ancestors_push(
         &meta,
         but_workspace::ref_info::Options {
             project_meta: ctx.project_meta()?,
-            traversal: but_graph::init::Options::limited(),
+            traversal: but_graph::walk::Options::limited(),
             expensive_commit_info: true,
             gerrit_mode,
         },

@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeSet, HashSet},
 };
 
+use crate::Direction;
 use anyhow::Context;
 use bstr::ByteSlice;
 use but_core::ref_metadata::{
@@ -11,50 +12,36 @@ use but_core::ref_metadata::{
 };
 use gix::{ObjectId, refs::Category};
 use itertools::Itertools;
-use petgraph::{Direction, prelude::EdgeRef, visit::NodeRef};
 use tracing::instrument;
 
 use crate::{
-    CommitFlags, Graph, Segment, SegmentIndex, Workspace,
+    CommitFlags, Graph, Segment, Workspace,
     utils::SeenTable,
     workspace::{
         Stack, StackCommit, StackCommitFlags, StackSegment, TargetCommit, TargetRef, WorkspaceKind,
-        workspace::{
-            WorkspaceReconciliationInput, WorkspaceState, find_segment_owner_indexes_by_refname,
-        },
+        workspace::find_segment_owner_indexes_by_refname,
     },
 };
-
-pub(crate) enum Downgrade {
-    /// Allows to turn a workspace above a selection to be downgraded back to the selection if it turns
-    /// out to be outside the workspace.
-    /// This is typically what you want when producing a workspace for display, as the workspace then isn't relevant.
-    Allow,
-    /// Use this if the closest workspace is what you want, even if the reference in question is below the workspace lower bound.
-    Disallow,
-}
 
 /// Shared graph-level workspace analysis before projection-only cleanup.
 ///
 /// `WorkspaceFrame` identifies the workspace tip, entrypoint relationship,
 /// target-side traversal context, and lower bound. Final projection turns it
-/// into [`WorkspaceState`] by collecting stacks and then applying display-only
-/// pruning/enrichment. Reconciliation turns it into
-/// [`WorkspaceReconciliationInput`] by collecting the same raw stack paths but
-/// keeping only the fields needed to reshape graph segments before projection.
+/// into [`Workspace`] by collecting stacks and then applying display-only
+/// pruning/enrichment.
 struct WorkspaceFrame {
     /// Workspace classifier derived from the entrypoint or containing workspace segment.
     kind: WorkspaceKind,
     /// Managed workspace metadata, if the frame is backed by a GitButler workspace ref.
     metadata: Option<ref_metadata::Workspace>,
     /// Segment that acts as the workspace tip for stack collection.
-    ws_tip_segment_id: SegmentIndex,
+    ws_tip_segment_id: usize,
     /// Original entrypoint segment when it is inside or below a containing workspace.
-    entrypoint_sidx: Option<SegmentIndex>,
+    entrypoint_sidx: Option<usize>,
     /// Commit id of the computed workspace lower bound.
     lower_bound: Option<ObjectId>,
     /// Segment that owns the computed workspace lower-bound commit.
-    lower_bound_segment_id: Option<SegmentIndex>,
+    lower_bound_segment_id: Option<usize>,
     /// Resolved target ref used as the workspace integration frame.
     target_ref: Option<TargetRef>,
     /// Resolved target commit used as an additional lower-bound anchor.
@@ -81,7 +68,7 @@ impl Graph {
     /// Further, the most expensive operations we perform to query additional commit information by reading it, but we
     /// only do so on the ones that the user can interact with.
     ///
-    /// Target commit ids and integrated traversal tips can extend the
+    /// Target commit ids and integrated traversal seeds can extend the
     /// workspace to include these commits to define its lowest base.
     #[instrument(
         name = "Graph::into_workspace",
@@ -90,23 +77,15 @@ impl Graph {
         err(Debug)
     )]
     pub fn into_workspace(self) -> anyhow::Result<Workspace> {
-        let state = self.to_workspace_state(Downgrade::Allow)?;
-        Ok(Workspace::from_state(self, state))
-    }
-
-    pub(crate) fn to_workspace_state(
-        &self,
-        downgrade: Downgrade,
-    ) -> anyhow::Result<WorkspaceState> {
-        let frame = self.workspace_frame(downgrade)?;
+        let frame = self.workspace_frame()?;
         let stacks = self.workspace_stacks(&frame)?;
         let mut target_ref = frame.target_ref;
 
         if let Some(target) = target_ref.as_mut() {
-            target.compute_and_set_commits_ahead(self, frame.lower_bound_segment_id);
+            target.compute_and_set_commits_ahead(&self, frame.lower_bound_segment_id);
         }
 
-        let mut ws = WorkspaceState {
+        let mut ws = Workspace {
             id: frame.ws_tip_segment_id,
             kind: frame.kind,
             stacks,
@@ -115,35 +94,94 @@ impl Graph {
             target_ref,
             target_commit: frame.target_commit,
             metadata: frame.metadata,
+            graph: self,
         };
 
         ws.prune_archived_segments();
-        ws.prune_integrated_segments(self);
-        ws.mark_remote_reachability(self)?;
-        ws.add_commits_on_remote(self);
+        ws.prune_integrated_segments();
+        ws.mark_remote_reachability()?;
+        ws.add_commits_on_remote();
         ws.truncate_single_stack_to_match_base();
+        ws.graph.debug_assert_applied_stacks_projected(&ws);
         Ok(ws)
     }
 
-    pub(crate) fn workspace_reconciliation_input(
-        &self,
-    ) -> anyhow::Result<Option<WorkspaceReconciliationInput>> {
-        let frame = self.workspace_frame(Downgrade::Disallow)?;
-        let Some(metadata) = frame.metadata.clone() else {
-            return Ok(None);
-        };
-        let stacks = self.workspace_stacks(&frame)?;
-        Ok(Some(WorkspaceReconciliationInput {
-            id: frame.ws_tip_segment_id,
-            stacks,
-            lower_bound_segment_id: frame.lower_bound_segment_id,
-            target_ref: frame.target_ref,
-            target_commit: frame.target_commit,
-            metadata,
-        }))
+    /// The lower-bound segment of the workspace frame, for debug-graph pruning.
+    pub(crate) fn workspace_lower_bound_segment_id(&self) -> Option<usize> {
+        self.workspace_frame().ok()?.lower_bound_segment_id
     }
 
-    fn workspace_frame(&self, downgrade: Downgrade) -> anyhow::Result<WorkspaceFrame> {
+    /// Test-build tripwire for the most dangerous projection failure: an APPLIED metadata stack
+    /// silently disappearing from `stacks`. Operations rebuild the workspace merge and metadata
+    /// heads from the projection, so a vanished stack does not just render wrong — it gets
+    /// PERSISTED by the next write. Scoped to managed workspaces; a stack counts only when at
+    /// least one non-archived branch of it actually names a segment in this graph.
+    #[cfg(debug_assertions)]
+    fn debug_assert_applied_stacks_projected(&self, ws: &Workspace) {
+        use but_core::ref_metadata::StackKind::Applied;
+        if !matches!(ws.kind, WorkspaceKind::Managed { .. }) {
+            return;
+        }
+        let Some(meta) = ws.metadata.as_ref() else {
+            return;
+        };
+        let projected: std::collections::HashSet<_> = ws
+            .stacks
+            .iter()
+            .flat_map(|s| s.segments.iter())
+            .filter_map(|s| s.ref_name().map(|r| r.to_owned()))
+            .collect();
+        // Only segments REACHABLE from the workspace tip count: metadata is the DESIRED state
+        // and legitimately runs ahead of the graph mid-operation (apply writes metadata before
+        // the workspace merge is rebuilt). The failure class is a branch that IS in the
+        // workspace's reach and still lost its stack.
+        let mut reachable = std::collections::HashSet::new();
+        self.visit_all_segments_including_start_until(ws.id, crate::Direction::Outgoing, |s| {
+            reachable.insert(s.id);
+            false
+        });
+        for stack in meta.stacks(Applied) {
+            let represented_branches: Vec<_> = stack
+                .branches
+                .iter()
+                .filter(|b| !b.archived)
+                .filter(|b| {
+                    self.segment_by_ref_name(b.ref_name.as_ref())
+                        .is_some_and(|s| {
+                            reachable.contains(&s.id)
+                            // A stack anchored on INTEGRATED territory away from the workspace
+                            // lower bound is deliberately not overzealously materialized; one
+                            // resting ON the lower bound (or holding live commits, or empty)
+                            // must keep its stack.
+                            && s.commits.first().is_none_or(|c| {
+                                !c.flags.contains(crate::CommitFlags::Integrated)
+                                    || Some(c.id) == ws.lower_bound
+                            })
+                        })
+                })
+                .map(|b| b.ref_name.clone())
+                .collect();
+            if represented_branches.is_empty() {
+                continue;
+            }
+            debug_assert!(
+                represented_branches
+                    .iter()
+                    .any(|b| projected.contains(b.as_ref())),
+                "applied metadata stack {:?} (branches {:?}) vanished from the projection —                  operations writing from this projection would drop the stack on disk",
+                stack.id,
+                represented_branches
+                    .iter()
+                    .map(|b| b.as_bstr().to_string())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_applied_stacks_projected(&self, _ws: &Workspace) {}
+
+    fn workspace_frame(&self) -> anyhow::Result<WorkspaceFrame> {
         let (
             mut kind,
             mut metadata,
@@ -229,7 +267,6 @@ impl Graph {
             .or_else(|| {
                 // target not available? Try the base of the workspace itself
                 if self
-                    .inner
                     .neighbors_directed(ws_tip_segment_id, Direction::Outgoing)
                     .count()
                     == 1
@@ -237,8 +274,7 @@ impl Graph {
                     None
                 } else {
                     self.find_best_effort_workspace_base(
-                        self.inner
-                            .neighbors_directed(ws_tip_segment_id, Direction::Outgoing),
+                        self.neighbors_directed(ws_tip_segment_id, Direction::Outgoing),
                     )
                     .and_then(|base| self[base].commits.first().map(|c| (c.id, base)))
                 }
@@ -276,13 +312,11 @@ impl Graph {
             .map(|(a, b)| (Some(a), Some(b)))
             .unwrap_or_default();
 
-        // The entrypoint is integrated and has a workspace above it.
-        // Right now we would be using it, but will discard it if the entrypoint is *at* or *below* the merge-base.
+        // The entrypoint is integrated and has a workspace above it: it gets downgraded back to
+        // an entrypoint-only (ad-hoc) view if it turns out to be *at* or *below* the merge-base,
+        // i.e. outside the workspace above.
         if let Some(((_lowest_base, lowest_base_sidx), ep_sidx)) = ws_lower_bound
-            .filter(|_| {
-                matches!(downgrade, Downgrade::Allow)
-                    && entrypoint_first_commit_flags.contains(CommitFlags::Integrated)
-            })
+            .filter(|_| entrypoint_first_commit_flags.contains(CommitFlags::Integrated))
             .zip(entrypoint_sidx)
             && (ep_sidx == lowest_base_sidx
                 || self
@@ -327,10 +361,10 @@ impl Graph {
     fn workspace_stacks(&self, frame: &WorkspaceFrame) -> anyhow::Result<Vec<Stack>> {
         let mut stacks = vec![];
         let (lowest_base, lowest_base_sidx) = (frame.lower_bound, frame.lower_bound_segment_id);
-        let preferred_parent_order_by_commit = frame
+        let preferred_next_segment_by_commit = frame
             .entrypoint_sidx
             .map(|entrypoint| {
-                self.preferred_parent_order_by_commit(
+                self.preferred_next_segment_by_commit(
                     frame.ws_tip_segment_id,
                     entrypoint,
                     frame.lower_bound_segment_id,
@@ -339,17 +373,18 @@ impl Graph {
             .unwrap_or_default();
         if frame.kind.has_managed_ref() {
             let mut used_stack_ids = BTreeSet::default();
-            for stack_top_sidx in self
-                .inner
-                .neighbors_directed(frame.ws_tip_segment_id, Direction::Outgoing)
-            {
+            let stack_tops: Vec<_> = self
+                .edges_directed(frame.ws_tip_segment_id, Direction::Outgoing)
+                .map(|edge| edge.target)
+                .collect();
+            for stack_top_sidx in stack_tops {
                 let stack_segment = &self[stack_top_sidx];
                 let has_seen_base = RefCell::new(false);
                 stacks.extend(
                     self.collect_stack_segments(
                         stack_top_sidx,
                         frame.entrypoint_sidx,
-                        &preferred_parent_order_by_commit,
+                        &preferred_next_segment_by_commit,
                         |s| {
                             let stop = true;
                             // The lowest base is a segment that all stacks will run into.
@@ -384,9 +419,8 @@ impl Graph {
                         |s| {
                             !*has_seen_base.borrow()
                                 && self
-                                    .inner
                                     .neighbors_directed(s.id, Direction::Incoming)
-                                    .all(|n| n.id() != frame.ws_tip_segment_id)
+                                    .all(|n| n != frame.ws_tip_segment_id)
                         },
                         |s| Some(s.id) == frame.lower_bound_segment_id && s.metadata.is_none(),
                     )?
@@ -407,7 +441,7 @@ impl Graph {
                             None
                         } else {
                             Some(Stack::from_base_and_segments(
-                                &self.inner,
+                                self,
                                 segments,
                                 stack_id.map(|(id, _in_workspace)| id),
                             ))
@@ -415,6 +449,10 @@ impl Graph {
                     }),
                 );
             }
+            // Stacks already arrive in workspace-parent-array order: the workspace commit's outgoing
+            // edges are sorted by the parent array during graph construction
+            // (`build`), and collecting them above preserves that order —
+            // no re-sort here.
         } else {
             let start = &self[frame.ws_tip_segment_id];
             let has_seen_base = RefCell::new(false);
@@ -422,7 +460,7 @@ impl Graph {
                 .collect_stack_segments(
                     start.id,
                     None,
-                    &preferred_parent_order_by_commit,
+                    &preferred_next_segment_by_commit,
                     |s| {
                         let stop = true;
                         if segment_name_is_special(s) {
@@ -447,11 +485,7 @@ impl Graph {
                     |_s| false,
                 )?
                 .map(|segments| {
-                    Stack::from_base_and_segments(
-                        &self.inner,
-                        segments,
-                        Some(StackId::single_branch_id()),
-                    )
+                    Stack::from_base_and_segments(self, segments, Some(StackId::single_branch_id()))
                 });
             if let Some(stack) = maybe_stack {
                 stacks.push(stack);
@@ -525,14 +559,13 @@ impl Graph {
         tip: ComputeBaseTip,
         target_ref: Option<&TargetRef>,
         target_commit: Option<&TargetCommit>,
-        integrated_tip_segments: &[SegmentIndex],
-    ) -> Option<(ObjectId, SegmentIndex)> {
+        integrated_tip_segments: &[usize],
+    ) -> Option<(ObjectId, usize)> {
         // It's important to not start from the tip, but instead find paths to the merge-base from each stack individually.
         // Otherwise, we may end up with a short path to a segment that isn't actually reachable by all stacks.
         let (tips, actual_tip) = match tip {
             ComputeBaseTip::WorkspaceCommit(ws_tip) => (
-                self.inner
-                    .neighbors_directed(ws_tip, Direction::Outgoing)
+                self.neighbors_directed(ws_tip, Direction::Outgoing)
                     .collect(),
                 ws_tip,
             ),
@@ -576,21 +609,21 @@ impl Graph {
     ///[`Self::find_merge_base_octopus()`].
     fn find_best_effort_workspace_base(
         &self,
-        segments: impl IntoIterator<Item = SegmentIndex>,
-    ) -> Option<SegmentIndex> {
+        segments: impl IntoIterator<Item = usize>,
+    ) -> Option<usize> {
         segments
             .into_iter()
             .reduce(|base, segment| self.find_merge_base(base, segment).unwrap_or(base))
     }
 
-    pub(super) fn integrated_tip_segments(&self) -> Vec<SegmentIndex> {
+    pub(super) fn integrated_tip_segments(&self) -> Vec<usize> {
         self.integrated_tip_segments_excluding_target_ref_tip(None)
     }
 
     /// Return target-remote tip segments that provide extra target context.
     ///
-    /// These are resolved from effective traversal tips with
-    /// [`crate::init::TipRole::TargetRemote`]. They are used as additional
+    /// These are resolved from effective traversal seeds with
+    /// [`crate::walk::SeedRole::TargetRemote`]. They are used as additional
     /// lower-bound candidates and as a signal that integrated commits should
     /// not be pruned from the workspace projection yet.
     ///
@@ -602,8 +635,8 @@ impl Graph {
     fn integrated_tip_segments_excluding_target_ref_tip(
         &self,
         target_ref: Option<&TargetRef>,
-    ) -> Vec<SegmentIndex> {
-        self.workspace_projection_target_remote_tips()
+    ) -> Vec<usize> {
+        self.workspace_projection_target_remote_seeds()
             .filter_map(|tip| {
                 TargetCommit::from_commit(tip.id, self)
                     .filter(|target| {
@@ -617,52 +650,59 @@ impl Graph {
 
     /// Return the first named integrated tip that can act as the workspace's target ref.
     ///
-    /// This is needed for graphs built with [`Graph::from_commit_traversal_tips()`], where callers
-    /// can provide a named [`crate::init::TipRole::TargetRemote`] target without workspace metadata. In that mode
+    /// This is needed for graphs built with [`Graph::from_seeds()`], where callers
+    /// can provide a named [`crate::walk::SeedRole::TargetRemote`] target without workspace metadata. In that mode
     /// there is no configured `target_ref` to resolve, but workspace projection can still expose the
     /// named integrated tip as the target ref for presentation and target-related queries.
     fn integrated_tip_target_ref(&self) -> Option<TargetRef> {
-        if self.has_workspace_metadata_tip() {
+        if self.has_workspace_metadata_seed() {
             return None;
         }
-        self.workspace_projection_target_remote_tips()
-            .filter_map(|tip| tip.ref_name.as_ref())
-            .find_map(|ref_name| TargetRef::from_ref_name_without_commits_ahead(ref_name, self))
+        self.workspace_projection_target_remote_seeds()
+            .filter_map(|tip| tip.ref_name)
+            .find_map(|ref_name| TargetRef::from_ref_name_without_commits_ahead(&ref_name, self))
     }
 
     /// Return the *lowest* target-remote tip that can act as the workspace's effective target commit.
     ///
-    /// This is needed for graphs built with [`Graph::from_commit_traversal_tips()`], where callers
-    /// can provide an explicit [`crate::init::TipRole::TargetRemote`] target without workspace metadata. In that
+    /// This is needed for graphs built with [`Graph::from_seeds()`], where callers
+    /// can provide an explicit [`crate::walk::SeedRole::TargetRemote`] target without workspace metadata. In that
     /// mode there is no stored `target_commit_id` to resolve, but workspace projection still needs a
     /// target commit to frame the lower bound and workspace view. When multiple target remotes are
-    /// available, choose the lowest one, i.e. the one with the highest segment generation.
+    /// available, choose the lowest one — deepest in history on the carried commit graph.
     fn integrated_tip_target_commit(&self, target_ref: Option<&TargetRef>) -> Option<TargetCommit> {
-        self.workspace_projection_target_remote_tips()
+        self.workspace_projection_target_remote_seeds()
             .filter_map(|tip| TargetCommit::from_commit(tip.id, self))
             .filter(|target| !self.target_ref_points_to_commit(target_ref, target.commit_id))
-            .max_by_key(|target| self[target.segment_index].generation)
+            .max_by_key(|target| {
+                std::cmp::Reverse(
+                    self.commit_graph()
+                        .node(target.commit_id)
+                        .map(|n| n.generation)
+                        .unwrap_or_default(),
+                )
+            })
     }
 
-    /// Target-remote traversal tips that workspace projection can use as target context.
+    /// Target-remote traversal seeds that workspace projection can use as target context.
     ///
-    /// `Graph::traversal_tips` stores every effective traversal tip. Workspace
+    /// `Graph::seeds` stores every effective traversal tip. Workspace
     /// projection treats all target-remote tips the same here, named or
     /// anonymous, and lets graph position decide which one is useful for lower
     /// bound computation. Workspace metadata still wins for configured
     /// `target_ref` and stored `target_commit_id`; these tips are fallback
     /// target context derived from traversal.
-    // TDOO: `traversal_tips` include the tips discovered in workspace metadata already, so the project code
-    //       doesn't have to access them specifically.
-    fn workspace_projection_target_remote_tips(&self) -> impl Iterator<Item = &crate::init::Tip> {
-        self.traversal_tips
-            .iter()
+    // TODO: `seeds` include the tips discovered in workspace metadata already, so the projection
+    //       wouldn't have to access metadata tips specifically.
+    fn workspace_projection_target_remote_seeds(&self) -> impl Iterator<Item = crate::walk::Seed> {
+        self.seeds()
+            .into_iter()
             .filter(|tip| tip.role.is_integrated())
     }
 
-    /// Return `true` if there is a traversal tip with workspace metadata attached.
-    fn has_workspace_metadata_tip(&self) -> bool {
-        self.traversal_tips
+    /// Return `true` if there is a traversal seed with workspace metadata attached.
+    fn has_workspace_metadata_seed(&self) -> bool {
+        self.seeds()
             .iter()
             .any(|tip| matches!(tip.metadata, Some(crate::SegmentMetadata::Workspace(_))))
     }
@@ -685,23 +725,20 @@ impl Graph {
             .is_some_and(|commit| commit.id == commit_id)
     }
 
-    /// Return commit-specific parent choices for the path from `start` down to `entrypoint`.
+    /// Return commit-specific next-segment choices for the path from `start` down to `entrypoint`.
     ///
-    /// Each graph edge knows which parent of its source commit it represents.
-    /// For a merge commit `M` with parents `[A, B]`, the edge from `M` to `A`
-    /// has parent order `0`, and the edge from `M` to `B` has parent order `1`.
-    /// This records the edge parent order for each source commit on the path
-    /// that reaches the entrypoint, then sorts by commit id so stack collection
+    /// For each merge commit on the path that reaches the entrypoint, this records which outgoing
+    /// segment to descend into to stay on that path, then sorts by commit id so stack collection
     /// can binary-search it while walking downward.
-    fn preferred_parent_order_by_commit(
+    fn preferred_next_segment_by_commit(
         &self,
-        start: SegmentIndex,
-        entrypoint: SegmentIndex,
-        lower_bound: Option<SegmentIndex>,
-    ) -> Vec<(ObjectId, u32)> {
+        start: usize,
+        entrypoint: usize,
+        lower_bound: Option<usize>,
+    ) -> Vec<(ObjectId, usize)> {
         let mut seen = self.seen_table();
         let mut out = Vec::new();
-        if !self.collect_preferred_parent_order_by_commit(
+        if !self.collect_preferred_next_segment_by_commit(
             start,
             entrypoint,
             lower_bound,
@@ -718,10 +755,10 @@ impl Graph {
     /// Depth-first search for one downward segment path from `current` to `entrypoint`.
     ///
     /// Edges point from a segment toward its parents in commit history. When the recursion finds
-    /// `entrypoint`, it returns `true` and unwinds, appending one `(source_commit_id, parent_order)`
-    /// pair for each edge on the successful path. The source commit id is enough to identify the
-    /// merge commit during later stack walking, and `parent_order` identifies which parent edge
-    /// keeps that walk on the entrypoint path.
+    /// `entrypoint`, it returns `true` and unwinds, appending one `(source_commit_id, next_segment)`
+    /// pair for each edge on the successful path. The source commit id identifies the merge commit
+    /// during later stack walking, and `next_segment` is the segment to descend into to keep that
+    /// walk on the entrypoint path.
     ///
     /// If `lower_bound` is set, the search does not descend past it. Reaching the lower-bound
     /// segment fails the current branch unless that segment is also `entrypoint`. This keeps the
@@ -732,13 +769,13 @@ impl Graph {
     /// graph, so the search cost is linear in the bounded reachable segment subgraph from `current`:
     /// `O(segments + edges)` up to the lower bound, with `O(segments)` visited storage and
     /// `O(path length)` output.
-    fn collect_preferred_parent_order_by_commit(
+    fn collect_preferred_next_segment_by_commit(
         &self,
-        current: SegmentIndex,
-        entrypoint: SegmentIndex,
-        lower_bound: Option<SegmentIndex>,
+        current: usize,
+        entrypoint: usize,
+        lower_bound: Option<usize>,
         seen: &mut SeenTable,
-        out: &mut Vec<(ObjectId, u32)>,
+        out: &mut Vec<(ObjectId, usize)>,
     ) -> bool {
         if current == entrypoint {
             return true;
@@ -750,17 +787,17 @@ impl Graph {
             return false;
         }
 
-        for edge in self.inner.edges_directed(current, Direction::Outgoing) {
+        for edge in self.edges_directed(current, Direction::Outgoing) {
             let before = out.len();
-            if self.collect_preferred_parent_order_by_commit(
-                edge.target(),
+            if self.collect_preferred_next_segment_by_commit(
+                edge.target,
                 entrypoint,
                 lower_bound,
                 seen,
                 out,
             ) {
-                if let Some(src_id) = edge.weight().src_id {
-                    out.push((src_id, edge.weight().parent_order));
+                if let Some(src_id) = edge.connection.src_id {
+                    out.push((src_id, edge.target));
                 }
                 return true;
             }
@@ -772,66 +809,52 @@ impl Graph {
 
 enum ComputeBaseTip {
     /// The tip is a workspace commit, and we should consider all of its stacks.
-    WorkspaceCommit(SegmentIndex),
+    WorkspaceCommit(usize),
     /// Use the tip directly.
-    SingleBranch(SegmentIndex),
+    SingleBranch(usize),
 }
 
-/// This works as named segments have been created in a prior step. Thus, we are able to find best matches by
-/// the amount of matching names, probably.
-/// Note that we find applied stack-ids first, then try again with unapplied ones, and indicate if it was applied or not.
-/// Update `seen` with the stack_id we find and avoid reusing seen stack ids.
+/// Match a collected projection stack to the metadata stack that identifies it: names are tried
+/// in segment order (a stack-segment's own name before its commits' refs), each name resolves to
+/// the first metadata stack mentioning it, and stack ids already claimed by an earlier projection
+/// stack are skipped. Returns the id plus whether that metadata stack is applied.
+///
+/// This works because every applied metadata branch names a segment by construction (the chain
+/// plan mints empty segments for branches without commits), so the first name in segment order
+/// is the authoritative one — a weighted global ranking censused corpus-equivalent to this.
 fn find_matching_stack_id(
     metadata: Option<&ref_metadata::Workspace>,
     segments: &[StackSegment],
     seen: &mut BTreeSet<StackId>,
 ) -> Option<(StackId, bool)> {
     let metadata = metadata?;
-
-    fn ref_names_with_weight(
-        s: &StackSegment,
-    ) -> impl Iterator<Item = (u64, &gix::refs::FullNameRef)> {
-        s.ref_info
-            .as_ref()
-            .map(|ri| (100_000, ri.ref_name.as_ref()))
-            .into_iter()
-            .chain(
-                s.commits
-                    .iter()
-                    .flat_map(|c| c.refs.iter().map(|ri| (1, ri.ref_name.as_ref()))),
-            )
-    }
-
-    segments
+    let found = segments
         .iter()
         .flat_map(|s| {
-            ref_names_with_weight(s).filter_map(|(weight, rn)| {
-                metadata.stacks(AppliedAndUnapplied).find_map(|meta_stack| {
-                    if let Some(bidx) = meta_stack
-                        .branches
+            s.ref_info
+                .as_ref()
+                .map(|ri| ri.ref_name.as_ref())
+                .into_iter()
+                .chain(
+                    s.commits
                         .iter()
-                        .enumerate()
-                        .find_map(|(bidx, b)| (rn == b.ref_name.as_ref()).then_some(bidx))
-                    {
-                        let priority = if bidx == 0 { 3 } else { 1 };
-                        Some((
-                            if meta_stack.is_in_workspace() {
-                                weight * 2
-                            } else {
-                                weight
-                            } * priority,
-                            meta_stack.id,
-                            meta_stack.is_in_workspace(),
-                        ))
-                    } else {
-                        None
-                    }
-                })
+                        .flat_map(|c| c.refs.iter().map(|ri| ri.ref_name.as_ref())),
+                )
+        })
+        .filter_map(|rn| {
+            metadata.stacks(AppliedAndUnapplied).find_map(|meta_stack| {
+                meta_stack
+                    .branches
+                    .iter()
+                    .any(|b| rn == b.ref_name.as_ref())
+                    .then_some((meta_stack.id, meta_stack.is_in_workspace()))
             })
         })
-        .sorted_by(|l, r| l.0.cmp(&r.0).reverse())
-        .map(|(_weight, stack_id, in_workspace)| (stack_id, in_workspace))
-        .find(|(stack_id, _)| seen.insert(*stack_id))
+        .find(|(id, _)| !seen.contains(id));
+    if let Some((id, _)) = found {
+        seen.insert(id);
+    }
+    found
 }
 
 /// Traversals
@@ -840,36 +863,27 @@ impl Graph {
     /// Also return the segment that we stopped at.
     /// **Important**: `stop` is not called with `start`, this is a feature.
     ///
-    /// `preferred_parent_order_by_commit` is a sorted list of `(commit_id, parent_order)` pairs
+    /// `preferred_next_segment_by_commit` is a sorted list of `(commit_id, next_segment)` pairs
     /// produced from the path between the workspace tip and the traversal entrypoint. During the
     /// stack walk, each outgoing edge is matched by its source commit id and parent order. If a
     /// matching hint exists, that edge is followed so a merge can walk through the parent that
     /// reaches the entrypoint. Without a hint for the current source commit, the preferred path
     /// falls back to the first-parent edge.
     ///
-    /// The `stop` signal is ignored for unnamed segments (no `ref_info`) whose `sibling_segment_id`
-    /// points to a segment already collected in the output. This prevents the traversal from stopping
-    /// at an ancestor-link segment that merely reconnects to a workspace branch we are already traversing.
-    ///
     /// Note that the traversal assumes as well-segmented graph without cycles.
     fn collect_first_parent_segments_until<'a>(
         &'a self,
         start: &'a Segment,
-        preferred_parent_order_by_commit: &[(ObjectId, u32)],
+        preferred_next_segment_by_commit: &[(ObjectId, usize)],
         mut stop: impl FnMut(&Segment) -> bool,
     ) -> (Vec<&'a Segment>, Option<&'a Segment>) {
         let mut out = vec![start.id];
         let mut stopped_at = None;
-        self.visit_segments_downward_with_parent_order_hints_exclude_start(
+        self.visit_segments_downward_with_segment_hints_exclude_start(
             start.id,
-            preferred_parent_order_by_commit,
+            preferred_next_segment_by_commit,
             |next| {
-                if stop(next)
-                    && !(next.ref_info.is_none()
-                        && next
-                            .sibling_segment_id
-                            .is_some_and(|sid| out.contains(&sid)))
-                {
+                if stop(next) {
                     stopped_at = Some(next.id);
                     return true;
                 }
@@ -886,17 +900,17 @@ impl Graph {
     /// Visit the ancestry of `start` along the preferred parent path, itself excluded, until `stop` returns `true`.
     /// **Important**: `stop` is not called with `start`, this is a feature.
     ///
-    /// `preferred_parent_order_by_commit` is a sorted list of `(commit_id, parent_order)` pairs.
-    /// Each outgoing edge is matched by its source commit id and parent order. If a matching
+    /// `preferred_next_segment_by_commit` is a sorted list of `(commit_id, next_segment)` pairs.
+    /// Each outgoing edge is matched by its source commit id. If a matching
     /// hint exists, that edge is followed. Without a hint for the current source commit, the
     /// walk falls back to the first-parent edge.
-    pub fn visit_segments_downward_with_parent_order_hints_exclude_start(
+    pub(crate) fn visit_segments_downward_with_segment_hints_exclude_start(
         &self,
-        start: SegmentIndex,
-        preferred_parent_order_by_commit: &[(ObjectId, u32)],
+        start: usize,
+        preferred_next_segment_by_commit: &[(ObjectId, usize)],
         mut stop: impl FnMut(&Segment) -> bool,
     ) {
-        let mut next = self.next_segment_downward(start, preferred_parent_order_by_commit);
+        let mut next = self.next_segment_downward(start, preferred_next_segment_by_commit);
         let mut seen = self.seen_table();
         while let Some(sidx) = next {
             let segment = &self[sidx];
@@ -904,7 +918,7 @@ impl Graph {
                 return;
             }
             next = if seen.insert_unseen(sidx) {
-                self.next_segment_downward(sidx, preferred_parent_order_by_commit)
+                self.next_segment_downward(sidx, preferred_next_segment_by_commit)
             } else {
                 None
             };
@@ -913,31 +927,28 @@ impl Graph {
 
     fn next_segment_downward(
         &self,
-        segment: SegmentIndex,
-        preferred_parent_order_by_commit: &[(ObjectId, u32)],
-    ) -> Option<SegmentIndex> {
-        let preferred_parent_order = self[segment]
-            .commits
-            .last()
-            .and_then(|commit| {
-                preferred_parent_order_by_commit
-                    .binary_search_by(|(id, _)| id.cmp(&commit.id))
-                    .ok()
-            })
-            .map(|hint_idx| preferred_parent_order_by_commit[hint_idx].1);
-        for edge in self.inner.edges_directed(segment, Direction::Outgoing) {
-            if preferred_parent_order.is_none_or(|order| edge.weight().parent_order == order) {
-                return Some(edge.target());
-            }
+        segment_id: usize,
+        preferred_next_segment_by_commit: &[(ObjectId, usize)],
+    ) -> Option<usize> {
+        // A hint records the exact next segment to descend into to stay on the entrypoint path, so
+        // follow it directly when present (it was captured from a real outgoing edge).
+        if let Some(commit) = self[segment_id].commits.last()
+            && let Ok(hint_idx) =
+                preferred_next_segment_by_commit.binary_search_by(|(id, _)| id.cmp(&commit.id))
+        {
+            return Some(preferred_next_segment_by_commit[hint_idx].1);
         }
-        None
+        // No hint: follow the first-parent edge (outgoing edges are kept in parent order).
+        self.edges_directed(segment_id, Direction::Outgoing)
+            .next()
+            .map(|edge| edge.target)
     }
 
     /// Visit all segments from `start`, excluding, and return once `find` returns something mapped from the
     /// first suitable segment it encountered.
     fn find_map_downwards_along_first_parent<T>(
         &self,
-        start: SegmentIndex,
+        start: usize,
         mut find: impl FnMut(&Segment) -> Option<T>,
     ) -> Option<T> {
         let mut out = None;
@@ -951,8 +962,8 @@ impl Graph {
         });
         out
     }
-    /// Return `OK(None)` if the post-process discarded this segment after collecting it in full as it was not
-    /// local a local branch.
+    /// Return `Ok(None)` if the whole stack was discarded after collection, e.g. because its
+    /// first segment isn't a local branch.
     ///
     /// `entrypoint_sidx` is passed to set the collected segment as entrypoint automatically.
     ///
@@ -969,9 +980,9 @@ impl Graph {
     /// If the stack is empty at the end, it will be discarded in full.
     fn collect_stack_segments(
         &self,
-        from: SegmentIndex,
-        mut entrypoint_sidx: Option<SegmentIndex>,
-        preferred_parent_order_by_commit: &[(ObjectId, u32)],
+        from: usize,
+        mut entrypoint_sidx: Option<usize>,
+        preferred_next_segment_by_commit: &[(ObjectId, usize)],
         mut is_one_past_end_of_stack_segment: impl FnMut(&Segment) -> bool,
         mut starts_next_stack_segment: impl FnMut(&Segment) -> bool,
         mut discard_stack: impl FnMut(&StackSegment) -> bool,
@@ -982,7 +993,7 @@ impl Graph {
             let start = &self[from];
             let (segments, stopped_at) = self.collect_first_parent_segments_until(
                 start,
-                preferred_parent_order_by_commit,
+                preferred_next_segment_by_commit,
                 &mut is_one_past_end_of_stack_segment,
             );
             let mut segment = StackSegment::from_graph_segments(&segments, self)?;
@@ -1026,7 +1037,7 @@ impl Graph {
     /// There is no traversal pruning.
     pub(crate) fn find_segment_upwards(
         &self,
-        start: SegmentIndex,
+        start: usize,
         mut f: impl FnMut(&Segment) -> bool,
     ) -> Option<&Segment> {
         let mut out = None;
@@ -1042,8 +1053,8 @@ impl Graph {
     }
 }
 
-/// More processing
-impl WorkspaceState {
+/// Projection-only pruning and enrichment, applied right after construction.
+impl Workspace {
     /// Match the archived flag from our workspace metadata by name with actual segments and prune them,
     /// top to bottom, but only if they are empty all the way down for safety.
     /// Doing so naturally shows segments that we have to show, independently of the archived flag.
@@ -1100,7 +1111,8 @@ impl WorkspaceState {
     /// the target via upstream integration.
     // TODO: the per-stack fork point is recomputed on every projection rather than
     //       stored; persisting it would avoid re-deriving the target trunk each build.
-    fn prune_integrated_segments(&mut self, graph: &Graph) {
+    fn prune_integrated_segments(&mut self) {
+        let graph = &self.graph;
         // Integrated-commit pruning only applies to workspaces tracking an upstream
         // target ref; without one, leave the stacks untouched.
         if self.target_ref.is_none() {
@@ -1124,34 +1136,32 @@ impl WorkspaceState {
             return;
         };
 
-        // Only build the segment set the chosen branch actually uses.
-        let prune_segments = if upstream_advanced_past_target {
+        // Only build the segment set the chosen branch actually uses. Dense by segment id:
+        // the walk touches every reachable segment, so hashing each id would dominate.
+        let mut prune_segments = vec![false; graph.id_bound()];
+        if upstream_advanced_past_target {
             // The target's first-parent trunk. Commits reaching the target only via a merge's
             // second parent are off it, so a branch's own work is preserved; only shared trunk
             // on a stack's first-parent spine is pruned.
-            let mut segments = HashSet::new();
             graph.visit_segments_downward_along_first_parent_include_start(
                 target_segment_index,
                 |s| {
-                    segments.insert(s.id);
+                    prune_segments[s.id] = true;
                     false
                 },
             );
-            segments
         } else {
             // The target segment itself plus all its ancestors (walk toward ancestors).
-            let mut segments = HashSet::new();
             graph.visit_all_segments_excluding_start_until(
                 target_segment_index,
                 Direction::Outgoing,
                 |s| {
-                    segments.insert(s.id);
+                    prune_segments[s.id] = true;
                     false
                 },
             );
-            segments.insert(target_segment_index);
-            segments
-        };
+            prune_segments[target_segment_index] = true;
+        }
 
         let metadata = self.metadata.as_ref();
         let keep_empty_segment_ids = if matches!(self.kind, WorkspaceKind::AdHoc) {
@@ -1162,7 +1172,7 @@ impl WorkspaceState {
                 .map(|ref_name| ref_name.as_ref())
                 .collect::<BTreeSet<_>>();
             graph
-                .node_weights()
+                .segments()
                 .filter_map(|segment| {
                     (segment.id == self.id
                         || segment
@@ -1176,23 +1186,45 @@ impl WorkspaceState {
         };
         let keep_if_fully_integrated =
             upstream_advanced_past_target && !matches!(self.kind, WorkspaceKind::AdHoc);
+        // The target's LOCAL tracking branch is exempt from integrated pruning when METADATA
+        // applies it as a stack in a MANAGED workspace: caught up with the target, ALL its
+        // commits are integrated by definition, so pruning would empty the stack by construction
+        // and slide its base to the workspace lower bound (`ref_target=M2, base=M1` — an
+        // incoherent segment). An applied main keeps its commits: its stack IS the base
+        // indicator. The single-branch view of a checked-out main keeps pruning its integrated
+        // base as before — membership, and thus the exemption, is metadata-explicit.
+        let target_local = self
+            .kind
+            .has_managed_ref()
+            .then(|| {
+                self.target_ref
+                    .as_ref()
+                    .and_then(|tr| graph.local_tracking_branch(tr.ref_name.as_ref()))
+                    .map(|local| local.as_ref())
+            })
+            .flatten();
         for stack in &mut self.stacks {
+            let is_target_local_stack =
+                stack.id.is_some() && stack.ref_name().is_some_and(|rn| Some(rn) == target_local);
             // Upstream advanced: floor the stack at its fork point but keep a fully-integrated
             // tip in managed workspaces so it survives for `integrate_upstream`. Single-branch
             // mode keeps the branch shell, but prunes integrated target/base commits from it.
-            prune_integrated_stack_segments(stack, &prune_segments, keep_if_fully_integrated);
-            remove_empty_branches(stack, metadata, &keep_empty_segment_ids);
-            if upstream_advanced_past_target {
-                // Pruning moved the stack's bottom; refresh its base to the new fork point.
-                stack.recompute_last_segment_base(&graph.inner);
+            if !is_target_local_stack {
+                prune_integrated_stack_segments(stack, &prune_segments, keep_if_fully_integrated);
             }
+            remove_empty_branches(stack, metadata, &keep_empty_segment_ids);
+            // Pruning moved the stack's bottom; refresh its base to its own fork point with the
+            // target rather than leaving the pre-prune global merge base. Every branch has its
+            // own base.
+            stack.recompute_last_segment_base(graph);
         }
         self.stacks.retain(|stack| !stack.segments.is_empty());
     }
 
     /// Trace the remotes of each segments down to their segment or other segments and set the commit flags accordingly
     /// to indicate if a commit in the workspace is reachable, and how.
-    fn mark_remote_reachability(&mut self, graph: &Graph) -> anyhow::Result<()> {
+    fn mark_remote_reachability(&mut self) -> anyhow::Result<()> {
+        let graph = &self.graph;
         let remote_refs: Vec<_> = self
             .stacks
             .iter()
@@ -1206,22 +1238,14 @@ impl WorkspaceState {
             })
             .collect();
         for (remote_tracking_ref_name, remote_sidx) in remote_refs {
-            let mut may_take_commits_from_first_remote = graph[remote_sidx].commits.is_empty();
             graph.visit_all_segments_including_start_until(remote_sidx, Direction::Outgoing, |s| {
+                // Stop at non-remote commits, and never 'steal' commits from other known remote
+                // segments: remote segments are minted from the plan's claimed set, so a commit
+                // reachable from two remotes has exactly one deliberate owner.
                 let prune = !s.commits.iter().all(|c| c.flags.is_remote())
-                    // Do not 'steal' commits from other known remote segments while they are officially connected,
-                    // unless we started out empty. That means ambiguous ownership, as multiple remotes point
-                    // to the same commit.
-                    || {
-                    let mut prune = s.id != remote_sidx
+                    || (s.id != remote_sidx
                         && s.ref_name()
-                        .is_some_and(|orn| orn.category() == Some(Category::RemoteBranch));
-                    if prune && may_take_commits_from_first_remote {
-                        prune = false;
-                        may_take_commits_from_first_remote = false;
-                    }
-                    prune
-                };
+                            .is_some_and(|orn| orn.category() == Some(Category::RemoteBranch)));
                 if prune {
                     // See if this segment links to a commit we know as local, and mark it accordingly,
                     // along with all segments in that stack.
@@ -1271,7 +1295,8 @@ impl WorkspaceState {
     /// - non-integrated commits from upper stack segments that are still on the
     ///   remote (the "branch split" case — a previously combined push left the
     ///   remote pointing at commits that now belong to branch above it).
-    fn add_commits_on_remote(&mut self, graph: &Graph) {
+    fn add_commits_on_remote(&mut self) {
+        let graph = &self.graph;
         for stack in &mut self.stacks {
             let mut above_commit_ids = HashSet::new();
             for seg_idx in 0..stack.segments.len() {
@@ -1281,16 +1306,9 @@ impl WorkspaceState {
                     continue;
                 };
 
-                // All-parents walk: collect commits from *fully*-remote segments.
-                // Stop at segments that contain non-remote commits or that belong
-                // to another remote-branch, unless this segment is empty and
-                // the first reachable remote commits can't be uniquely attributed.
-                // This happens if multiple remote tracking branches point to the same commit,
-                // which is when ours might be a virtual segment because it was traversed after
-                // the segment that was prioritized to own the commit.
-                // So `may_take_from_first_remote` allows us to pretend that these commits
-                // belong to our remote (which they do as well from a pure graph perspective).
-                let mut may_take_from_first_remote = graph[rsidx].commits.is_empty();
+                // All-parents walk: collect commits from *fully*-remote segments, stopping
+                // at segments with non-remote commits or ones owned by another remote branch
+                // (ownership is unambiguous — remote segments are minted from the claimed set).
                 let mut remote_commits = Vec::new();
                 graph.visit_all_segments_including_start_until(
                     rsidx,
@@ -1304,11 +1322,7 @@ impl WorkspaceState {
                                 .ref_name()
                                 .is_some_and(|rn| rn.category() == Some(Category::RemoteBranch))
                         {
-                            if may_take_from_first_remote {
-                                may_take_from_first_remote = false;
-                            } else {
-                                return true;
-                            }
+                            return true;
                         }
                         for commit in &segment.commits {
                             remote_commits.push(StackCommit::from_graph_commit(commit));
@@ -1385,7 +1399,7 @@ impl WorkspaceState {
 /// untouched, keeping a fully-integrated branch's tip visible for `integrate_upstream`.
 fn prune_integrated_stack_segments(
     stack: &mut Stack,
-    prune_segments: &HashSet<SegmentIndex>,
+    prune_segments: &[bool],
     keep_if_fully_integrated: bool,
 ) {
     // Walk stack segments bottom-up, then graph-segment blocks bottom-up within
@@ -1402,7 +1416,7 @@ fn prune_integrated_stack_segments(
         }
 
         if seg.commits_by_segment.is_empty() {
-            if commits_are_integrated(&seg.commits) && prune_segments.contains(&seg.id) {
+            if commits_are_integrated(&seg.commits) && prune_segments[seg.id] {
                 cut = Some((seg_idx, 0));
                 continue;
             }
@@ -1418,7 +1432,7 @@ fn prune_integrated_stack_segments(
                 .map_or(seg.commits.len(), |(_, offset)| *offset);
             let commits = &seg.commits[start_offset..end_offset];
 
-            if prune_segments.contains(&segment_id) && commits_are_integrated(commits) {
+            if prune_segments[segment_id] && commits_are_integrated(commits) {
                 cut = Some((seg_idx, start_offset));
             } else {
                 has_surviving_commit = true;
@@ -1464,7 +1478,7 @@ fn commits_are_integrated(commits: &[StackCommit]) -> bool {
 fn remove_empty_branches(
     stack: &mut Stack,
     metadata: Option<&but_core::ref_metadata::Workspace>,
-    keep_empty_segment_ids: &HashSet<SegmentIndex>,
+    keep_empty_segment_ids: &HashSet<usize>,
 ) {
     let own_metadata_stack = stack.id.and_then(|stack_id| {
         metadata.and_then(|meta| meta.stacks(Applied).find(|ms| ms.id == stack_id))

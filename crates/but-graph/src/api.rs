@@ -1,22 +1,16 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeSet, BinaryHeap},
-    ops::{Deref, Index, IndexMut},
+    ops::{Index, IndexMut},
 };
 
+use crate::{Direction, segment_graph::EdgeRef};
 use anyhow::{Context as _, bail, ensure};
-use petgraph::{
-    Direction,
-    prelude::EdgeRef,
-    stable_graph::EdgeReference,
-    visit::{IntoEdgeReferences, NodeIndexable, Visitable},
-};
 
 use crate::{
-    Commit, CommitFlags, CommitIndex, Edge, EntryPoint, EntryPointCommit, Graph, Segment,
-    SegmentFlags, SegmentIndex, SegmentRelation, StopCondition,
-    init::PetGraph,
-    utils::{SegmentTable, SegmentVisitScratch},
+    Commit, CommitFlags, CommitIndex, EntryPoint, EntryPointCommit, Graph, Segment, SegmentFlags,
+    StopCondition,
+    utils::{ScratchTable, SegmentVisitScratch},
     workspace::commit::is_managed_workspace_by_message,
 };
 
@@ -24,11 +18,30 @@ boolean_enums::gen_boolean_enum!(pub FirstParent);
 
 /// Mutation
 impl Graph {
+    /// The commit graph this segment graph was assembled from — the commit-addressed substrate
+    /// consumers migrate to. Empty only for hand-assembled graphs that never went through the
+    /// builders.
+    pub fn commit_graph(&self) -> &crate::CommitGraph {
+        &self.commit_graph
+    }
+
+    /// The LOCAL branch tracking `remote`, as the builder derived it from the repository
+    /// (a git-configured binding, or name-deduction against the workspace's symbolic remotes).
+    /// `None` when no local tracks `remote`, or for graphs not born from the builders.
+    pub fn local_tracking_branch(
+        &self,
+        remote: &gix::refs::FullNameRef,
+    ) -> Option<&gix::refs::FullName> {
+        self.remote_tracking
+            .iter()
+            .find_map(|(local, r)| (r.as_ref() == remote).then_some(local))
+    }
+
     /// Insert `segment` to the graph so that it's not connected to any other segment, and return its index.
     ///
     /// Note that as a side effect, the [entrypoint](Self::entrypoint()) will also be set if it's not
     /// set yet.
-    pub fn insert_segment_set_entrypoint(&mut self, segment: Segment) -> SegmentIndex {
+    pub fn insert_segment_set_entrypoint(&mut self, segment: Segment) -> usize {
         let entrypoint = segment
             .commits
             .first()
@@ -42,9 +55,9 @@ impl Graph {
     }
 
     /// Insert `segment` to the graph so that it's not connected to any other segment, and return its index.
-    pub fn insert_segment(&mut self, segment: Segment) -> SegmentIndex {
-        let index = self.inner.add_node(segment);
-        self.inner[index].id = index;
+    pub fn insert_segment(&mut self, segment: Segment) -> usize {
+        let index = self.add_segment(segment);
+        self[index].id = index;
         index
     }
 
@@ -59,66 +72,52 @@ impl Graph {
     /// `dst_commit_id` can be provided if the connection is to a future commit that isn't yet available
     /// in the `segment`. If `None`, it will be looked up in the `segment` itself.
     ///
-    /// `parent_order` is the 0-based position of `dst_commit_id` among the source commit's
-    /// parents. For a merge commit with parents `[A, B]`, the edge to `A` must use `0`,
-    /// and the edge to `B` must use `1`, even if traversal discovers `B` before `A`.
-    ///
     /// Return the newly added segment.
     pub fn connect_new_segment(
         &mut self,
-        src: SegmentIndex,
+        src: usize,
         src_commit: impl Into<Option<CommitIndex>>,
         dst: Segment,
         dst_commit: impl Into<Option<CommitIndex>>,
         dst_commit_id: impl Into<Option<gix::ObjectId>>,
-        parent_order: u32,
-    ) -> SegmentIndex {
-        let dst = self.inner.add_node(dst);
-        self.inner[dst].id = dst;
-        self.connect_segments_with_ids(
-            src,
-            src_commit,
-            None,
+    ) -> usize {
+        let dst = self.add_segment(dst);
+        self[dst].id = dst;
+        let src_commit = src_commit.into();
+        let dst_commit = dst_commit.into();
+        let connection = crate::Connection::new(
             dst,
-            dst_commit,
-            dst_commit_id.into(),
-            parent_order,
+            self[src].commit_id_by_index(src_commit),
+            dst_commit_id
+                .into()
+                .or_else(|| self[dst].commit_id_by_index(dst_commit)),
         );
+        self.add_edge(src, connection);
+        self.order_outgoing_connections_by_first_parent(src);
         dst
+    }
+
+    /// Keep `src`'s outgoing connections in first-parent order — each target's position among the
+    /// source commit's parents. Commit-less connections (empty branches) carry no destination id and
+    /// sort last. The sort is *stable*, so the pre-existing relative order is the tie-break that
+    /// downstream stable sorts inherit (the connections are kept ordered after every insertion, so
+    /// this only ever moves the just-added one into its slot).
+    fn order_outgoing_connections_by_first_parent(&mut self, src: usize) {
+        let src_parents: Vec<gix::ObjectId> = self[src]
+            .commits
+            .last()
+            .map(|c| c.parent_ids.clone())
+            .unwrap_or_default();
+        self[src].connections.sort_by_key(|c| {
+            c.dst_id()
+                .and_then(|dst| src_parents.iter().position(|p| *p == dst))
+                .unwrap_or(usize::MAX)
+        });
     }
 }
 
 /// Merge-base computation
 impl Graph {
-    /// Determine the ancestry relationship of `a` relative to `b`.
-    ///
-    /// `Ancestor` means `a` is reachable from `b` when walking towards history,
-    /// `Descendant` means the inverse, and `Diverged` means they share history
-    /// but neither is ancestor of the other.
-    pub fn relation_between(&self, a: SegmentIndex, b: SegmentIndex) -> SegmentRelation {
-        if a == b {
-            return SegmentRelation::Identity;
-        }
-
-        match self.find_merge_base(a, b) {
-            Some(base) if base == a => SegmentRelation::Ancestor,
-            Some(base) if base == b => SegmentRelation::Descendant,
-            Some(_) => SegmentRelation::Diverged,
-            None => SegmentRelation::Disjoint,
-        }
-    }
-
-    /// Like [`Self::relation_between()`], but takes object ids of commits.
-    pub fn relation_between_by_commit_id(
-        &self,
-        commit_a: gix::ObjectId,
-        commit_b: gix::ObjectId,
-    ) -> anyhow::Result<SegmentRelation> {
-        let a = self.segment_id_by_commit_id(commit_a)?;
-        let b = self.segment_id_by_commit_id(commit_b)?;
-        Ok(self.relation_between(a, b))
-    }
-
     /// Compute the merge-base just like Git would between segments `a` and `b`, but finding all possible merge-bases of a walk,
     /// which are then truncated to the highest merge-base that includes all the other merge-bases.
     ///
@@ -126,34 +125,21 @@ impl Graph {
     ///
     /// Returns `None` if there is no merge-base as `a` and `b` don't share history.
     /// If `a == b`, `Some(a)` is returned immediately.
-    pub fn find_merge_base(&self, a: SegmentIndex, b: SegmentIndex) -> Option<SegmentIndex> {
+    pub fn find_merge_base(&self, a: usize, b: usize) -> Option<usize> {
         if a == b {
             return Some(a);
         }
 
-        let mut flags = SegmentTable::new(self.inner.node_bound(), SegmentFlags::empty());
-        let bases = self.paint_down_to_common(a, b, &mut flags);
+        let mut flags = ScratchTable::new(self.id_bound(), SegmentFlags::empty());
+        let generations = self.derived_generations();
+        let bases = self.paint_down_to_common(a, b, &mut flags, &generations);
 
         if bases.is_empty() {
             return None;
         }
 
-        let result = self.remove_redundant(&bases, &mut flags);
+        let result = self.remove_redundant(&bases, &mut flags, &generations);
         result.first().copied()
-    }
-
-    /// Like [`Self::find_merge_base()`], but takes object ids of commits,
-    /// returning the id of the commit that is the merge-base.
-    pub fn find_merge_base_by_commit_id(
-        &self,
-        commit_a: gix::ObjectId,
-        commit_b: gix::ObjectId,
-    ) -> anyhow::Result<Option<gix::ObjectId>> {
-        let a = self.segment_id_by_commit_id(commit_a)?;
-        let b = self.segment_id_by_commit_id(commit_b)?;
-        self.find_merge_base(a, b)
-            .map(|base| self.commit_id_by_segment(base))
-            .transpose()
     }
 
     /// Return all commits reachable from `included`, but not reachable from `excluded`.
@@ -168,11 +154,11 @@ impl Graph {
     /// excluded side only as far as needed to prove emitted segments are not hidden.
     ///
     /// If `first_parent` is [`FirstParent::Yes`], both the included and excluded traversals follow
-    /// only segment edges with `parent_order == 0`.
+    /// only the first-parent edge (the source commit's first parent).
     pub fn find_commits_reachable_from_a_not_b(
         &self,
-        included: SegmentIndex,
-        excluded: SegmentIndex,
+        included: usize,
+        excluded: usize,
         first_parent: FirstParent,
     ) -> Vec<&Commit> {
         self.find_segments_reachable_from_a_not_b(included, excluded, first_parent)
@@ -192,15 +178,16 @@ impl Graph {
     /// excluded side only as far as needed to prove emitted segments are not hidden.
     ///
     /// If `first_parent` is [`FirstParent::Yes`], both the included and excluded traversals follow
-    /// only segment edges with `parent_order == 0`.
-    pub fn find_segments_reachable_from_a_not_b(
+    /// only the first-parent edge (the source commit's first parent).
+    pub(crate) fn find_segments_reachable_from_a_not_b(
         &self,
-        included: SegmentIndex,
-        excluded: SegmentIndex,
+        included: usize,
+        excluded: usize,
         first_parent: FirstParent,
     ) -> impl Iterator<Item = &Segment> {
         let first_parent: bool = first_parent.into();
-        let mut flags = SegmentTable::new(self.inner.node_bound(), SegmentFlags::empty());
+        let mut flags = ScratchTable::new(self.id_bound(), SegmentFlags::empty());
+        let generations = self.derived_generations();
         let mut queue = BinaryHeap::new();
         let mut sequence = 0;
         self.queue_segment_for_reachable_difference(
@@ -209,6 +196,7 @@ impl Graph {
             &mut flags,
             &mut queue,
             &mut sequence,
+            &generations,
         );
         self.queue_segment_for_reachable_difference(
             excluded,
@@ -216,6 +204,7 @@ impl Graph {
             &mut flags,
             &mut queue,
             &mut sequence,
+            &generations,
         );
 
         let mut segments = Vec::new();
@@ -231,12 +220,14 @@ impl Graph {
                         &mut flags,
                         &mut queue,
                         &mut sequence,
+                        &generations,
                     );
                 }
                 if self.excluded_frontier_is_past_emitted_segments(
                     &queue,
                     &flags,
                     max_emitted_generation,
+                    &generations,
                 ) {
                     break;
                 }
@@ -247,7 +238,7 @@ impl Graph {
                 continue;
             }
 
-            let generation = self[segment_id].generation;
+            let generation = generations.get(segment_id);
             max_emitted_generation =
                 Some(max_emitted_generation.map_or(generation, |max| max.max(generation)));
             segments.push(segment_id);
@@ -260,6 +251,7 @@ impl Graph {
                     &mut flags,
                     &mut queue,
                     &mut sequence,
+                    &generations,
                 );
             }
         }
@@ -279,11 +271,12 @@ impl Graph {
     /// from tips toward history in a deterministic segment order.
     fn queue_segment_for_reachable_difference(
         &self,
-        segment_id: SegmentIndex,
+        segment_id: usize,
         is_excluded: bool,
-        flags: &mut SegmentTable<SegmentFlags>,
-        queue: &mut BinaryHeap<(Reverse<usize>, Reverse<usize>, bool, SegmentIndex)>,
+        flags: &mut ScratchTable<SegmentFlags>,
+        queue: &mut BinaryHeap<(Reverse<usize>, Reverse<usize>, bool, usize)>,
         sequence: &mut usize,
+        generations: &ScratchTable<usize>,
     ) {
         let segment_flags = flags.get_mut(segment_id);
         if is_excluded {
@@ -300,7 +293,7 @@ impl Graph {
         }
 
         queue.push((
-            Reverse(self[segment_id].generation),
+            Reverse(generations.get(segment_id)),
             Reverse(*sequence),
             is_excluded,
             segment_id,
@@ -314,13 +307,18 @@ impl Graph {
     /// returns only edges whose destination is the source commit's first parent.
     fn parent_segments_for_reachable_difference(
         &self,
-        segment_id: SegmentIndex,
+        segment_id: usize,
         first_parent_only: bool,
-    ) -> impl Iterator<Item = SegmentIndex> {
-        self.inner
-            .edges_directed(segment_id, Direction::Outgoing)
-            .filter(move |edge| !first_parent_only || edge.weight().parent_order == 0)
-            .map(|edge| edge.target())
+    ) -> impl Iterator<Item = usize> {
+        // Outgoing edges are kept in first-parent order (see
+        // `rebuild_outgoing_edges_for_traversal_order`), so first-parent traversal follows just the
+        // first edge. Matching by the destination commit id instead would dead-end whenever the
+        // first-parent edge crosses into a commit-less segment (an empty branch), whose edge carries
+        // no destination id to match against.
+        let max_edges = if first_parent_only { 1 } else { usize::MAX };
+        self.edges_directed(segment_id, Direction::Outgoing)
+            .map(|edge| edge.target)
+            .take(max_edges)
     }
 
     /// Return `true` once the excluded-side frontier cannot still hide any segment already emitted.
@@ -332,9 +330,10 @@ impl Graph {
     /// excluded side and filter the segments that were already marked hidden.
     fn excluded_frontier_is_past_emitted_segments(
         &self,
-        queue: &BinaryHeap<(Reverse<usize>, Reverse<usize>, bool, SegmentIndex)>,
-        flags: &SegmentTable<SegmentFlags>,
+        queue: &BinaryHeap<(Reverse<usize>, Reverse<usize>, bool, usize)>,
+        flags: &ScratchTable<SegmentFlags>,
         max_emitted_generation: Option<usize>,
+        generations: &ScratchTable<usize>,
     ) -> bool {
         if queue.iter().any(|(_, _, is_excluded, segment_id)| {
             !*is_excluded && !flags.get(*segment_id).contains(SegmentFlags::SEGMENT2)
@@ -348,7 +347,7 @@ impl Graph {
         let Some(min_excluded_generation) = queue
             .iter()
             .filter_map(|(_, _, is_excluded, segment_id)| {
-                is_excluded.then_some(self[*segment_id].generation)
+                is_excluded.then_some(generations.get(*segment_id))
             })
             .min()
         else {
@@ -360,8 +359,8 @@ impl Graph {
 
     /// Return all commit ids reachable from `included`, but not reachable from `excluded`.
     ///
-    /// This is a convenience wrapper around
-    /// [`Self::find_segments_reachable_from_a_not_b()`], taking object ids of commits.
+    /// This is a convenience wrapper around the segment-level reachable-difference
+    /// walk, taking object ids of commits.
     /// If `first_parent` is [`FirstParent::Yes`], both traversals follow only first-parent edges.
     pub fn find_commit_ids_reachable_from_a_not_b(
         &self,
@@ -389,26 +388,11 @@ impl Graph {
     /// If `segments` has one element, it returns that.
     pub fn find_merge_base_octopus(
         &self,
-        segments: impl IntoIterator<Item = SegmentIndex>,
-    ) -> Option<SegmentIndex> {
+        segments: impl IntoIterator<Item = usize>,
+    ) -> Option<usize> {
         let mut segments = segments.into_iter();
         let first = segments.next()?;
         segments.try_fold(first, |base, segment| self.find_merge_base(base, segment))
-    }
-
-    /// Like [`Self::find_merge_base_octopus()`], but works with object ids of `commits`,
-    /// returning the id of the commit that is the merge-base.
-    pub fn find_merge_base_octopus_by_commit_id(
-        &self,
-        commits: impl IntoIterator<Item = gix::ObjectId>,
-    ) -> anyhow::Result<Option<gix::ObjectId>> {
-        let mut segments = Vec::new();
-        for commit_id in commits {
-            segments.push(self.segment_id_by_commit_id(commit_id)?);
-        }
-        self.find_merge_base_octopus(segments)
-            .map(|base| self.commit_id_by_segment(base))
-            .transpose()
     }
 
     /// Return `(commit, owner_sidx_of_commit)` for `start` as long as it can unambiguously be attributed
@@ -420,10 +404,10 @@ impl Graph {
     /// shared commit.
     ///
     /// This helper intentionally stops at ambiguous segments with more than one outgoing connection.
-    pub fn resolve_to_unambiguously_pointed_to_commit(
+    pub(crate) fn resolve_to_unambiguously_pointed_to_commit(
         &self,
-        start: SegmentIndex,
-    ) -> Option<(&crate::Commit, SegmentIndex)> {
+        start: usize,
+    ) -> Option<(&crate::Commit, usize)> {
         if let Some(commit) = self[start].commits.first() {
             return Some((commit, start));
         }
@@ -431,19 +415,19 @@ impl Graph {
         let mut current = start;
         let mut seen = BTreeSet::new(); // SeenTable isn't worth it here.
         while seen.insert(current) {
-            let mut parents = self.inner.neighbors_directed(current, Direction::Outgoing);
+            let mut parents = self.neighbors_directed(current, Direction::Outgoing);
             let Some(parent) = parents.next() else {
                 tracing::warn!(
-                    start = start.index(),
-                    current = current.index(),
+                    start = start,
+                    current = current,
                     "Could not resolve empty segment as it has no outgoing parent segment"
                 );
                 return None;
             };
             if parents.next().is_some() {
                 tracing::warn!(
-                    start = start.index(),
-                    current = current.index(),
+                    start = start,
+                    current = current,
                     "Could not resolve empty segment as it has multiple outgoing parent segments"
                 );
                 return None;
@@ -455,39 +439,43 @@ impl Graph {
             }
         }
         tracing::warn!(
-            start = start.index(),
-            current = current.index(),
+            start = start,
+            current = current,
             "Could not resolve empty segment as traversal ended, there were only empty segments or none at all"
         );
         None
     }
 
-    fn commit_id_by_segment(&self, segment: SegmentIndex) -> anyhow::Result<gix::ObjectId> {
-        self.tip_skip_empty(segment)
-            .map(|commit| commit.id)
-            .with_context(|| {
-                format!("BUG: Segment {segment:?} does not contain a reachable tip commit")
-            })
-    }
-
     /// Return the id of the segment that owns `commit_id`, or error if it wasn't found.
     /// That is unexpected as the traversal is supposed to find all commits of interest.
-    pub fn segment_id_by_commit_id(
-        &self,
-        commit_id: gix::ObjectId,
-    ) -> anyhow::Result<SegmentIndex> {
+    pub fn segment_id_by_commit_id(&self, commit_id: gix::ObjectId) -> anyhow::Result<usize> {
         self.segment_by_commit_id(commit_id).map(|s| s.id)
     }
 
     /// Return the segment that owns `commit_id`, or error if it wasn't found.
     /// That is unexpected as the traversal is supposed to find all commits of interest.
     pub fn segment_by_commit_id(&self, commit_id: gix::ObjectId) -> anyhow::Result<&Segment> {
-        self.inner
-            .node_weights()
+        self.segments()
             .find(|s| s.commits.iter().any(|c| c.id == commit_id))
             .with_context(|| {
                 format!("Commit {commit_id} not found in any segment, it wasn't traversed")
             })
+    }
+
+    /// Longest path from a root (a segment with no incoming connection); roots are generation
+    /// 0. Derived on demand — the structure is final once built, so this is a pure function of
+    /// the graph (formerly a stored per-segment field maintained by the builder). Used as the
+    /// walk priority of the merge-base family: lower = closer to the tips.
+    pub(crate) fn derived_generations(&self) -> ScratchTable<usize> {
+        let mut depth = ScratchTable::new(self.id_bound(), 0usize);
+        for sidx in self.toposort() {
+            let g = depth.get(sidx);
+            for edge in self.edges_directed(sidx, Direction::Outgoing) {
+                let e = depth.get_mut(edge.target);
+                *e = (*e).max(g + 1);
+            }
+        }
+        depth
     }
 
     /// Paint segments reachable from `first` with SEGMENT1 and from `second` with SEGMENT2.
@@ -495,24 +483,25 @@ impl Graph {
     /// Returns all potential merge-bases with their generation numbers.
     fn paint_down_to_common(
         &self,
-        first: SegmentIndex,
-        second: SegmentIndex,
-        flags: &mut SegmentTable<SegmentFlags>,
-    ) -> Vec<(SegmentIndex, usize)> {
+        first: usize,
+        second: usize,
+        flags: &mut ScratchTable<SegmentFlags>,
+        generations: &ScratchTable<usize>,
+    ) -> Vec<(usize, usize)> {
         // Priority queue ordered by generation (higher generation = closer to root = lower priority).
         // We use Reverse because BinaryHeap is a max-heap and we want segments with *lower* generation
         // (i.e. closer to tips) to be processed first.
-        let mut queue: BinaryHeap<(Reverse<usize>, SegmentIndex)> = BinaryHeap::new();
+        let mut queue: BinaryHeap<(Reverse<usize>, usize)> = BinaryHeap::new();
 
         // Initialize first segment
         let first_flags = flags.get_mut(first);
         *first_flags |= SegmentFlags::SEGMENT1;
-        queue.push((Reverse(self[first].generation), first));
+        queue.push((Reverse(generations.get(first)), first));
 
         // Initialize second segment
         let second_flags = flags.get_mut(second);
         *second_flags |= SegmentFlags::SEGMENT2;
-        queue.push((Reverse(self[second].generation), second));
+        queue.push((Reverse(generations.get(second)), second));
 
         let mut out = Vec::new();
 
@@ -543,14 +532,11 @@ impl Graph {
             }
 
             // Propagate flags to parents (outgoing direction = towards history)
-            for parent_id in self
-                .inner
-                .neighbors_directed(segment_id, Direction::Outgoing)
-            {
+            for parent_id in self.neighbors_directed(segment_id, Direction::Outgoing) {
                 let parent_flags = flags.get_mut(parent_id);
                 if (*parent_flags & flags_without_result) != flags_without_result {
                     *parent_flags |= flags_without_result;
-                    queue.push((Reverse(self[parent_id].generation), parent_id));
+                    queue.push((Reverse(generations.get(parent_id)), parent_id));
                 }
             }
         }
@@ -562,9 +548,10 @@ impl Graph {
     /// That way, we return only the topologically most recent segments in `segments`.
     fn remove_redundant(
         &self,
-        segments: &[(SegmentIndex, usize)],
-        flags: &mut SegmentTable<SegmentFlags>,
-    ) -> Vec<SegmentIndex> {
+        segments: &[(usize, usize)],
+        flags: &mut ScratchTable<SegmentFlags>,
+        generations: &ScratchTable<usize>,
+    ) -> Vec<usize> {
         if segments.is_empty() {
             return Vec::new();
         }
@@ -582,23 +569,23 @@ impl Graph {
         let mut min_gen_pos = 0;
         let mut min_gen = sorted_segments[min_gen_pos].1;
 
-        let mut walk_start: Vec<(SegmentIndex, usize)> = Vec::with_capacity(segments.len());
+        let mut walk_start: Vec<(usize, usize)> = Vec::with_capacity(segments.len());
 
         // Mark all input segments with RESULT and collect their parents for walking
         for (sidx, _) in segments {
             flags.get_mut(*sidx).insert(SegmentFlags::RESULT);
 
-            for parent_id in self.inner.neighbors_directed(*sidx, Direction::Outgoing) {
+            for parent_id in self.neighbors_directed(*sidx, Direction::Outgoing) {
                 let parent_flags = flags.get_mut(parent_id);
                 // Prevent double-addition
                 if !parent_flags.contains(SegmentFlags::STALE) {
                     parent_flags.insert(SegmentFlags::STALE);
-                    walk_start.push((parent_id, self[parent_id].generation));
+                    walk_start.push((parent_id, generations.get(parent_id)));
                 }
             }
         }
 
-        walk_start.sort_by_key(|(sidx, _)| sidx.index());
+        walk_start.sort_by_key(|(sidx, _)| *sidx);
 
         // Allow walking everything at first (remove STALE from walk_start entries)
         for (sidx, _) in &walk_start {
@@ -606,7 +593,7 @@ impl Graph {
         }
 
         let mut count_still_independent = segments.len();
-        let mut stack: Vec<(SegmentIndex, usize)> = Vec::new();
+        let mut stack: Vec<(usize, usize)> = Vec::new();
 
         while let Some((segment_id, segment_gen)) = walk_start.pop() {
             if count_still_independent <= 1 {
@@ -649,14 +636,11 @@ impl Graph {
 
                 let previous_len = stack.len();
 
-                for parent_id in self
-                    .inner
-                    .neighbors_directed(current_id, Direction::Outgoing)
-                {
+                for parent_id in self.neighbors_directed(current_id, Direction::Outgoing) {
                     let parent_flags = flags.get_mut(parent_id);
                     if !parent_flags.contains(SegmentFlags::STALE) {
                         parent_flags.insert(SegmentFlags::STALE);
-                        stack.push((parent_id, self[parent_id].generation));
+                        stack.push((parent_id, generations.get(parent_id)));
                     }
                 }
 
@@ -705,7 +689,7 @@ impl Graph {
         let (segment_index, commit) = self
             .entrypoint
             .context("BUG: must always set the entrypoint")?;
-        let segment = self.inner.node_weight(segment_index).with_context(|| {
+        let segment = self.segment(segment_index).with_context(|| {
             format!("BUG: entrypoint segment at {segment_index:?} wasn't present")
         })?;
         let commit_and_owner = match commit {
@@ -733,6 +717,13 @@ impl Graph {
             commit_and_owner,
         })
     }
+
+    /// The entrypoint as plain data: the segment id traversal started at, along with the tip
+    /// commit id, `None` inside for an unborn entrypoint.
+    pub fn entrypoint_segment_and_commit_id(&self) -> Option<(usize, Option<gix::ObjectId>)> {
+        let (segment_index, commit) = self.entrypoint?;
+        Some((segment_index, commit.object_id()))
+    }
 }
 
 /// Query
@@ -747,12 +738,12 @@ impl Graph {
     ///
     /// ### Performance
     ///
-    /// This is a brute-force search through all nodes and all data in the graph - beware of hot-loop usage.
+    /// This is a brute-force search through all segments and all data in the graph - beware of hot-loop usage.
     pub fn segment_and_commit_by_ref_name(
         &self,
         name: &gix::refs::FullNameRef,
     ) -> Option<(&Segment, &Commit)> {
-        self.inner.node_weights().find_map(|s| {
+        self.segments().find_map(|s| {
             if s.ref_name().is_some_and(|rn| rn == name) {
                 self.tip_skip_empty(s.id).map(|c| (s, c))
             } else {
@@ -772,14 +763,13 @@ impl Graph {
     ///
     /// ### Performance
     ///
-    /// This is a brute-force search through all nodes and all data in the graph - beware of hot-loop usage.
+    /// This is a brute-force search through all segments and all data in the graph - beware of hot-loop usage.
     pub fn segment_by_ref_name(&self, name: &gix::refs::FullNameRef) -> Option<&Segment> {
-        self.inner
-            .node_weights()
+        self.segments()
             .find(|s| s.ref_name().is_some_and(|rn| rn == name))
     }
 
-    /// Starting at `segment`, return the commit it owns, or the commit it
+    /// Starting at `segment_id`, return the commit it owns, or the commit it
     /// unambiguously points to through empty segments.
     ///
     /// Empty virtual segments can stand in for refs whose commit is owned by a
@@ -788,8 +778,8 @@ impl Graph {
     ///
     /// Returns `None` if any empty segment on the path has zero or multiple
     /// outgoing connections, as there is no unambiguous commit to return.
-    pub fn tip_skip_empty(&self, segment: SegmentIndex) -> Option<&Commit> {
-        self.resolve_to_unambiguously_pointed_to_commit(segment)
+    pub fn tip_skip_empty(&self, segment_id: usize) -> Option<&Commit> {
+        self.resolve_to_unambiguously_pointed_to_commit(segment_id)
             .map(|(c, _)| c)
     }
 
@@ -798,16 +788,16 @@ impl Graph {
     /// **Important**: `stop` is not called with `start`, this is a feature.
     pub fn visit_segments_downward_along_first_parent_exclude_start(
         &self,
-        start: SegmentIndex,
+        start: usize,
         stop: impl FnMut(&Segment) -> bool,
     ) {
         self.visit_segments_downward_along_first_parent(start, false, stop);
     }
 
     /// Visit the ancestry of `start` along the first parents, including `start`, until `stop` returns `true`.
-    pub fn visit_segments_downward_along_first_parent_include_start(
+    pub(crate) fn visit_segments_downward_along_first_parent_include_start(
         &self,
-        start: SegmentIndex,
+        start: usize,
         stop: impl FnMut(&Segment) -> bool,
     ) {
         self.visit_segments_downward_along_first_parent(start, true, stop);
@@ -815,17 +805,16 @@ impl Graph {
 
     fn visit_segments_downward_along_first_parent(
         &self,
-        start: SegmentIndex,
+        start: usize,
         include_start: bool,
         mut stop: impl FnMut(&Segment) -> bool,
-    ) -> Option<SegmentIndex> {
+    ) -> Option<usize> {
         let mut next = if include_start {
             Some(start)
         } else {
-            self.inner
-                .edges_directed(start, Direction::Outgoing)
+            self.edges_directed(start, Direction::Outgoing)
                 .next()
-                .map(|edge| edge.target())
+                .map(|edge| edge.target)
         };
         let mut seen = self.seen_table();
         while let Some(sidx) = next {
@@ -834,10 +823,9 @@ impl Graph {
                 return Some(sidx);
             }
             next = if seen.insert_unseen(sidx) {
-                self.inner
-                    .edges_directed(sidx, Direction::Outgoing)
+                self.edges_directed(sidx, Direction::Outgoing)
                     .next()
-                    .map(|edge| edge.target())
+                    .map(|edge| edge.target)
             } else {
                 None
             };
@@ -852,53 +840,64 @@ impl Graph {
     /// Such a graph is possibly partial, which can affect algorithms
     /// relying on it being complete.
     pub fn hard_limit_hit(&self) -> bool {
-        self.hard_limit_hit
+        self.commit_graph.hard_limit_hit
     }
 
     /// Claim that the graph was pruned without regard to the core graph algorithm.
-    pub fn set_hard_limit_hit(&mut self) {
-        self.hard_limit_hit = true;
+    pub(crate) fn set_hard_limit_hit(&mut self) {
+        self.commit_graph.hard_limit_hit = true;
+    }
+
+    /// The graph's effective traversal seeds: for EXPLICIT-seeds builds the walk's normalized
+    /// seeds (the projection reads their roles, e.g. integrated tips), otherwise the
+    /// extra-target tip when its commit made it into a segment.
+    pub(crate) fn seeds(&self) -> Vec<crate::walk::Seed> {
+        if self.commit_graph.explicit_seeds {
+            return self.commit_graph.seeds.clone();
+        }
+        self.options
+            .extra_target_commit_id
+            .filter(|&extra| {
+                self.segment_ids()
+                    .any(|sidx| self[sidx].commits.iter().any(|c| c.id == extra))
+            })
+            .map(|extra| {
+                crate::walk::Seed::new(extra).with_role(crate::walk::SeedRole::TargetRemote)
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Lookup the segment of `sidx` and then find its sibling segment, if it has one.
-    pub fn lookup_sibling_segment(&self, sidx: SegmentIndex) -> Option<&Segment> {
-        self.inner.node_weight(sidx)?.sibling_segment(self)
-    }
-
-    /// Lookup the segment of `sidx` and then find its remote tracking branch segment, if it has one.
-    pub fn lookup_remote_tracking_branch_segment(&self, sidx: SegmentIndex) -> Option<&Segment> {
-        self.inner.node_weight(
-            self.inner
-                .node_weight(sidx)?
-                .remote_tracking_branch_segment_id?,
-        )
+    pub(crate) fn lookup_sibling_segment(&self, sidx: usize) -> Option<&Segment> {
+        self.segment(sidx)?.sibling_segment(self)
     }
 
     /// Return all segments which have no other segments *above* them, making them tips.
     ///
     /// Typically, there is only one, but there *can* be multiple technically.
-    pub fn tip_segments(&self) -> impl Iterator<Item = SegmentIndex> {
-        self.inner.externals(Direction::Incoming)
+    pub fn tip_segments(&self) -> impl Iterator<Item = usize> {
+        self.externals(Direction::Incoming)
     }
 
     /// Return all segments which have no other segments *below* them, making them bases.
     ///
     /// Typically, there is only one, but there can easily be multiple.
-    pub fn base_segments(&self) -> impl Iterator<Item = SegmentIndex> {
-        self.inner.externals(Direction::Outgoing)
+    pub fn base_segments(&self) -> impl Iterator<Item = usize> {
+        self.externals(Direction::Outgoing)
     }
 
     /// Return all segments that are both [base segments](Self::base_segments) and which
     /// aren't fully defined as traversal stopped due to some abort condition being met.
     /// Valid partial segments always have at least one commit.
-    pub fn partial_segments(&self) -> impl Iterator<Item = SegmentIndex> {
+    pub fn partial_segments(&self) -> impl Iterator<Item = usize> {
         self.base_segments().filter(|s| self.is_partial_segment(*s))
     }
 
     /// Return `true` if the segment behind `sidx`
     /// isn't fully defined as traversal stopped due to some abort condition.
     /// Valid partial segments always have at least one commit.
-    fn is_partial_segment(&self, sidx: SegmentIndex) -> bool {
+    fn is_partial_segment(&self, sidx: usize) -> bool {
         self.stop_condition(sidx)
             .is_some_and(|condition| condition.is_unnatural())
     }
@@ -913,22 +912,23 @@ impl Graph {
     /// [`Segment::commits`] field of `sidx`.
     pub fn segments_below_in_order(
         &self,
-        sidx: SegmentIndex,
-    ) -> impl Iterator<Item = (Option<CommitIndex>, SegmentIndex)> {
-        self.inner
-            .edges_directed(sidx, Direction::Outgoing)
-            .filter_map(|edge| {
-                let dst = edge.weight().dst;
-                dst.is_none_or(|dst| dst == 0)
-                    .then_some((edge.weight().src, edge.target()))
+        sidx: usize,
+    ) -> impl Iterator<Item = (Option<CommitIndex>, usize)> {
+        // A present source id is the source's last commit; a present destination id is the
+        // target's first — the finished-graph invariant `check_edge` validates.
+        let src_last = self[sidx].last_commit_index();
+        self.edges_directed(sidx, Direction::Outgoing)
+            .filter_map(move |edge| {
+                let target_first = self[edge.target].commits.first().map(|c| c.id);
+                (edge.connection.dst_id().is_none() || edge.connection.dst_id() == target_first)
+                    .then_some((edge.connection.src_id().and(src_last), edge.target))
             })
     }
 
     /// Return the condition under which traversal stopped at `sidx`,
     /// or `None` if the traversal didn't stop.
-    pub fn stop_condition(&self, sidx: SegmentIndex) -> Option<StopCondition> {
+    pub fn stop_condition(&self, sidx: usize) -> Option<StopCondition> {
         if self
-            .inner
             .edges_directed(sidx, Direction::Outgoing)
             .next()
             .is_some()
@@ -951,25 +951,19 @@ impl Graph {
 
     /// Return the number of segments stored within the graph.
     pub fn num_segments(&self) -> usize {
-        self.inner.node_count()
+        self.segment_count()
     }
 
     /// Return the number of edges that are connecting segments.
     pub fn num_connections(&self) -> usize {
-        self.inner.edge_count()
+        self.edge_count()
     }
 
     /// Return the number of commits in all segments.
     pub fn num_commits(&self) -> usize {
-        self.inner
-            .node_indices()
+        self.segment_ids()
             .map(|n| self[n].commits.len())
             .sum::<usize>()
-    }
-
-    /// Return an iterator over all indices of segments in the graph.
-    pub fn segments(&self) -> impl Iterator<Item = SegmentIndex> {
-        self.inner.node_indices()
     }
 
     /// Visit all segments, including `start`, until `visit_and_prune(segment)` returns `true`.
@@ -977,7 +971,7 @@ impl Graph {
     /// be called multiple times until the traversal stops.
     pub fn visit_all_segments_including_start_until(
         &self,
-        start: SegmentIndex,
+        start: usize,
         direction: Direction,
         visit_and_prune: impl FnMut(&Segment) -> bool,
     ) {
@@ -990,23 +984,12 @@ impl Graph {
     /// be called multiple times until the traversal stops.
     pub fn visit_all_segments_excluding_start_until(
         &self,
-        start: SegmentIndex,
+        start: usize,
         direction: Direction,
         visit_and_prune: impl FnMut(&Segment) -> bool,
     ) {
         let mut scratch = SegmentVisitScratch::new(self);
         scratch.visit_excluding_start_until(self, start, direction, visit_and_prune);
-    }
-}
-
-/// Query
-///
-/// The query relies on the segmentation of the graph being as advertised, something we assure as part
-/// of the initial creation.
-impl Graph {
-    /// Return a utility to perform topological walks on the graph.
-    pub fn topo_walk(&self) -> petgraph::visit::Topo<SegmentIndex, <PetGraph as Visitable>::Map> {
-        petgraph::visit::Topo::new(&self.inner)
     }
 }
 
@@ -1017,12 +1000,11 @@ impl Graph {
     /// Final-graph invariants are skipped if the traversal hit the hard limit,
     /// as these graphs are explicitly partial.
     pub fn validated(self) -> anyhow::Result<Self> {
-        if !self.hard_limit_hit {
+        if !self.hard_limit_hit() {
             self.check_entrypoint_invariants()?;
-            for segment_index in self.inner.node_indices() {
-                let segment = &self.inner[segment_index];
+            for segment_index in self.segment_ids() {
+                let segment = &self[segment_index];
                 let outgoing = self
-                    .inner
                     .neighbors_directed(segment_index, Direction::Outgoing)
                     .count();
                 self.check_virtual_segments_are_empty_and_connected(
@@ -1036,12 +1018,15 @@ impl Graph {
                     outgoing,
                 )?;
             }
-            for tip in &self.traversal_tips {
-                self.check_traversal_tip_points_to_first_commit(tip)?;
+            for tip in self.seeds() {
+                self.check_seed_points_to_first_commit(&tip)?;
             }
+            self.check_ref_names_unique_and_unannotated()?;
+            self.check_first_commits_unique()?;
+            self.check_remote_links()?;
         }
-        for edge in self.inner.edge_references() {
-            Self::check_edge(&self.inner, edge, false)?;
+        for edge in self.edge_references() {
+            Self::check_edge(&self, edge, false)?;
         }
         Ok(self)
     }
@@ -1053,23 +1038,22 @@ impl Graph {
     /// - The graph entrypoint exists, points to an existing segment, matches the
     ///   remembered entrypoint ref when one exists, and remembers a commit id
     ///   that is still represented in the graph.
-    /// - Virtual segments are empty, named graph nodes for real Git refs whose
+    /// - Virtual segments are empty, named segments for real Git refs whose
     ///   commit is owned elsewhere, and connected according to their
     ///   GitButler-only role.
-    /// - Tip and ancestor segments with multiple parents own at least one commit.
+    /// - Seed and ancestor segments with multiple parents own at least one commit.
     /// - Traversal tips resolve to the first commit they describe.
     ///
     /// This always checks:
     ///
-    /// - Edge weights still match the source and destination segment endpoints.
+    /// - Edge connections still match the source and destination segment endpoints.
     pub fn validation_errors(&self) -> Vec<anyhow::Error> {
         let mut out = Vec::new();
-        if !self.hard_limit_hit {
+        if !self.hard_limit_hit() {
             out.extend(self.check_entrypoint_invariants().err());
-            for segment_index in self.inner.node_indices() {
-                let segment = &self.inner[segment_index];
+            for segment_index in self.segment_ids() {
+                let segment = &self[segment_index];
                 let outgoing = self
-                    .inner
                     .neighbors_directed(segment_index, Direction::Outgoing)
                     .count();
                 out.extend(
@@ -1090,15 +1074,17 @@ impl Graph {
                 );
             }
             out.extend(
-                self.traversal_tips
+                self.seeds()
                     .iter()
-                    .filter_map(|tip| self.check_traversal_tip_points_to_first_commit(tip).err()),
+                    .filter_map(|tip| self.check_seed_points_to_first_commit(tip).err()),
             );
+            out.extend(self.check_ref_names_unique_and_unannotated().err());
+            out.extend(self.check_first_commits_unique().err());
+            out.extend(self.check_remote_links().err());
         }
         out.extend(
-            self.inner
-                .edge_references()
-                .filter_map(|edge| Self::check_edge(&self.inner, edge, false).err()),
+            self.edge_references()
+                .filter_map(|edge| Self::check_edge(self, edge, false).err()),
         );
         out
     }
@@ -1106,8 +1092,8 @@ impl Graph {
     /// The entrypoint is the user-facing traversal anchor.
     ///
     /// It must always point at an existing segment in completed graphs. If a
-    /// ref name was remembered for it, post-processing must have moved the
-    /// entrypoint to the segment with that name.
+    /// ref name was remembered for it, the graph build must have placed the
+    /// entrypoint on the segment with that name.
     ///
     /// If the entrypoint remembers a commit id, that id must either be the first
     /// commit of its segment or be owned elsewhere as the first commit of another segment.
@@ -1120,8 +1106,7 @@ impl Graph {
             .entrypoint
             .context("completed graph must have an entrypoint")?;
         let segment = self
-            .inner
-            .node_weight(entrypoint_sidx)
+            .segment(entrypoint_sidx)
             .with_context(|| format!("entrypoint segment at {entrypoint_sidx:?} wasn't present"))?;
 
         if let Some(entrypoint_ref) = self.entrypoint_ref.as_ref() {
@@ -1169,7 +1154,7 @@ impl Graph {
         Ok(())
     }
 
-    /// Virtual segments are empty graph nodes that correspond to real Git
+    /// Virtual segments are empty segments that correspond to real Git
     /// references whose commits are owned by another segment.
     ///
     /// Ordinary virtual segments can resolve to the commit named by their refs by
@@ -1184,7 +1169,7 @@ impl Graph {
     /// the same commit; GitButler sees one or more ordered stacks of branches.
     fn check_virtual_segments_are_empty_and_connected(
         &self,
-        segment_index: SegmentIndex,
+        segment_index: usize,
         segment: &Segment,
         outgoing: usize,
     ) -> anyhow::Result<()> {
@@ -1211,13 +1196,13 @@ impl Graph {
         Ok(())
     }
 
-    /// Tip and ancestor segments with multiple parents must own a commit.
+    /// Seed and ancestor segments with multiple parents must own a commit.
     ///
     /// Empty virtual workspace tip segments are excluded because they can fan
     /// out from one real workspace ref to multiple stack tips.
     fn check_multi_parent_tip_or_ancestor_segments_have_commits(
         &self,
-        segment_index: SegmentIndex,
+        segment_index: usize,
         segment: &Segment,
         outgoing: usize,
     ) -> anyhow::Result<()> {
@@ -1232,16 +1217,13 @@ impl Graph {
         Ok(())
     }
 
-    /// A retained traversal tip must resolve to its first commit.
+    /// A retained traversal seed must resolve to its first commit.
     ///
     /// If the segment named by the tip is empty, following its single outgoing
     /// edge chain must reach a non-empty segment whose first commit is the tip
     /// id. This validates the final-graph form of the initial tip-segment
     /// invariant.
-    fn check_traversal_tip_points_to_first_commit(
-        &self,
-        tip: &crate::init::Tip,
-    ) -> anyhow::Result<()> {
+    fn check_seed_points_to_first_commit(&self, tip: &crate::walk::Seed) -> anyhow::Result<()> {
         if let Ok(segment_owning_tip_id) = self.segment_by_commit_id(tip.id) {
             ensure!(
                 segment_owning_tip_id.commit_index_of(tip.id) == Some(0),
@@ -1287,73 +1269,131 @@ impl Graph {
         Ok(())
     }
 
+    /// A ref names at most ONE segment — `segment_by_ref_name` and every naming pass assume
+    /// it — and a segment-naming ref must not also be annotated on a commit (it would show
+    /// twice; the builder strips it).
+    fn check_ref_names_unique_and_unannotated(&self) -> anyhow::Result<()> {
+        let mut seen: std::collections::HashMap<&gix::refs::FullNameRef, usize> =
+            std::collections::HashMap::new();
+        for sidx in self.segment_ids() {
+            if let Some(name) = self[sidx].ref_name()
+                && let Some(prev) = seen.insert(name, sidx)
+            {
+                bail!(
+                    "ref {name} names two segments: {prev:?} and {sidx:?}",
+                    name = name.as_bstr()
+                );
+            }
+        }
+        for sidx in self.segment_ids() {
+            for commit in &self[sidx].commits {
+                for r in &commit.refs {
+                    ensure!(
+                        !seen.contains_key(&r.ref_name.as_ref()),
+                        "ref {name} names segment {owner:?} but is also annotated on commit {id} in {sidx:?}",
+                        name = r.ref_name.as_bstr(),
+                        owner = seen[&r.ref_name.as_ref()],
+                        id = commit.id,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// No two segments may START at the same LOCAL commit: connections resolve to first
+    /// commits, so a duplicate twin is unreachable-by-endpoint and dangles (the
+    /// overlapping-region class). Remote-only commits are exempt — every remote segment shows
+    /// its own copy of a shared remote-ahead commit by design.
+    fn check_first_commits_unique(&self) -> anyhow::Result<()> {
+        let mut seen: std::collections::HashMap<gix::ObjectId, usize> =
+            std::collections::HashMap::new();
+        for sidx in self.segment_ids() {
+            if let Some(first) = self[sidx]
+                .commits
+                .first()
+                .filter(|c| c.flags.contains(crate::CommitFlags::NotInRemote))
+                .map(|c| c.id)
+                && let Some(prev) = seen.insert(first, sidx)
+            {
+                bail!("commit {first} is the first commit of two segments: {prev:?} and {sidx:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// A local segment's remote-tracking link is bidirectional and name-consistent: the linked
+    /// remote segment is named by the local's remote-tracking ref and points back via its
+    /// sibling link (the reconcile class — naming passes used to break these silently).
+    fn check_remote_links(&self) -> anyhow::Result<()> {
+        for sidx in self.segment_ids() {
+            let s = &self[sidx];
+            let Some(remote_sidx) = s.remote_tracking_branch_segment_id else {
+                continue;
+            };
+            let Some(remote) = self.segment(remote_sidx) else {
+                bail!(
+                    "segment {sidx:?} links remote-tracking segment {remote_sidx:?} which does not exist"
+                );
+            };
+            if let (Some(expected), Some(actual)) =
+                (s.remote_tracking_ref_name.as_ref(), remote.ref_name())
+            {
+                ensure!(
+                    expected.as_ref() == actual,
+                    "segment {sidx:?} tracks {expected} but its linked remote segment {remote_sidx:?} is named {actual}",
+                    expected = expected.as_bstr(),
+                    actual = actual.as_bstr(),
+                );
+            }
+            ensure!(
+                remote.sibling_segment_id == Some(sidx),
+                "remote segment {remote_sidx:?} must point back at {sidx:?} via its sibling link, points at {:?}",
+                remote.sibling_segment_id,
+            );
+        }
+        Ok(())
+    }
+
     /// Fail with an error if the `edge` isn't consistent.
     pub(crate) fn check_edge(
-        graph: &PetGraph,
-        edge: EdgeReference<'_, Edge>,
-        weight_only: bool,
+        graph: &Graph,
+        edge: EdgeRef<'_>,
+        connection_only: bool,
     ) -> anyhow::Result<()> {
         let e = edge;
-        let src = &graph[e.source()];
-        let dst = &graph[e.target()];
-        let w = e.weight();
-        let display = if weight_only {
+        let src = &graph[e.source];
+        let dst = &graph[e.target];
+        let w = e.connection;
+        let display = if connection_only {
             w as &dyn std::fmt::Debug
         } else {
             &e as &dyn std::fmt::Debug
         };
-        if w.src != src.last_commit_index() {
-            bail!(
-                "{display:?}: edge must start on last commit {last:?}",
-                last = src.last_commit_index()
-            );
+        let src_last = src.commits.last().map(|c| c.id);
+        if w.src_id != src_last {
+            bail!("{display:?}: edge must start on the source's last commit {src_last:?}");
         }
-        let first_index = dst.commits.first().map(|_| 0);
-        if w.dst != first_index {
-            bail!("{display:?}: edge must end on {first_index:?}");
-        }
-
-        let seg_cidx = src.commit_id_by_index(w.src);
-        if w.src_id != seg_cidx {
-            bail!(
-                "{display:?}: the desired source index didn't match the one in the segment {seg_cidx:?}"
-            );
-        }
-        let seg_cidx = dst.commit_id_by_index(w.dst);
-        if w.dst_id != seg_cidx {
-            bail!(
-                "{display:?}: the desired destination index didn't match the one in the segment {seg_cidx:?}"
-            );
+        let dst_first = dst.commits.first().map(|c| c.id);
+        if w.dst_id != dst_first {
+            bail!("{display:?}: edge must end on the target's first commit {dst_first:?}");
         }
         Ok(())
     }
 }
 
-impl Index<SegmentIndex> for Graph {
+impl Index<usize> for Graph {
     type Output = Segment;
 
-    fn index(&self, index: SegmentIndex) -> &Self::Output {
-        &self.inner[index]
+    fn index(&self, index: usize) -> &Self::Output {
+        self.segment(index)
+            .expect("segment id refers to a live segment")
     }
 }
 
-impl IndexMut<SegmentIndex> for Graph {
-    fn index_mut(&mut self, index: SegmentIndex) -> &mut Self::Output {
-        &mut self.inner[index]
-    }
-}
-
-impl Deref for Graph {
-    type Target = PetGraph;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-// This in particular is only for those who know what they are doing.
-impl std::ops::DerefMut for Graph {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+impl IndexMut<usize> for Graph {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.segment_mut(index)
+            .expect("segment id refers to a live segment")
     }
 }

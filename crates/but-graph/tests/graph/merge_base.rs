@@ -1,11 +1,9 @@
 use anyhow::Context;
-use but_graph::{
-    CommitFlags, FirstParent, Graph, Segment, SegmentIndex, SegmentRelation, init::Tip,
-};
+use but_graph::{CommitFlags, FirstParent, Graph, Segment, walk::Seed};
 use but_testsupport::{graph_tree, visualize_commit_graph_all};
-use snapbox::IntoData;
+use snapbox::prelude::*;
 
-use crate::init::{read_only_in_memory_scenario, standard_options};
+use crate::walk::{read_only_in_memory_scenario, standard_options};
 
 #[test]
 fn find_git_merge_base_handles_duplicate_queue_entries_and_redundant_bases() -> anyhow::Result<()> {
@@ -39,23 +37,23 @@ fn find_git_merge_base_handles_duplicate_queue_entries_and_redundant_bases() -> 
         snapbox::str![[r#"
 
 └── 👉►:0[0]:merged[🌳]
-    └── ·8a6c109 (⌂|1)
+    └── ·8a6c109 (⌂)
         ├── ►:1[1]:A
-        │   └── ·62b409a (⌂|1)
-        │       ├── ►:3[2]:anon:
-        │       │   └── ·592abec (⌂|1)
+        │   └── ·62b409a (⌂)
+        │       ├── ►:4[2]:anon:
+        │       │   └── ·592abec (⌂)
         │       │       └── ►:7[3]:main
-        │       │           └── 🏁·965998b (⌂|1)
-        │       └── ►:4[2]:B
-        │           └── ·f16dddf (⌂|1)
+        │       │           └── 🏁·965998b (⌂)
+        │       └── ►:6[2]:B
+        │           └── ·f16dddf (⌂)
         │               └── →:7: (main)
         └── ►:2[1]:C
-            └── ·7ed512a (⌂|1)
-                ├── ►:5[2]:anon:
-                │   └── ·35ee481 (⌂|1)
+            └── ·7ed512a (⌂)
+                ├── ►:3[2]:anon:
+                │   └── ·35ee481 (⌂)
                 │       └── →:7: (main)
-                └── ►:6[2]:D
-                    └── ·ecb1877 (⌂|1)
+                └── ►:5[2]:D
+                    └── ·ecb1877 (⌂)
                         └── →:7: (main)
 
 "#]]
@@ -65,7 +63,7 @@ fn find_git_merge_base_handles_duplicate_queue_entries_and_redundant_bases() -> 
 }
 
 #[test]
-fn relation_between_matches_merge_base_in_redundant_ancestor_case() -> anyhow::Result<()> {
+fn merge_base_in_redundant_ancestor_case() -> anyhow::Result<()> {
     let (repo, meta) = read_only_in_memory_scenario("four-diamond")?;
     let graph = Graph::from_head(
         &repo,
@@ -79,34 +77,34 @@ fn relation_between_matches_merge_base_in_redundant_ancestor_case() -> anyhow::R
     let a = segment_id_by_ref_name(&graph, "refs/heads/A")?;
     let c = segment_id_by_ref_name(&graph, "refs/heads/C")?;
 
-    assert_eq!(graph.relation_between(a, merged), SegmentRelation::Ancestor);
-    assert_eq!(
-        graph.relation_between(merged, a),
-        SegmentRelation::Descendant
-    );
-    assert_eq!(graph.relation_between(a, c), SegmentRelation::Diverged);
+    // `a` is an ancestor of `merged` (either order), while `a` and `c` diverge: they share
+    // history without one being the base of the other.
+    assert_eq!(graph.find_merge_base(a, merged), Some(a));
+    assert_eq!(graph.find_merge_base(merged, a), Some(a));
+    let base = graph.find_merge_base(a, c);
+    assert!(base.is_some_and(|base| base != a && base != c));
     snapbox::assert_data_eq!(
         graph_tree(&graph).to_string(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:merged[🌳]
-    └── ·8a6c109 (⌂|1)
+    └── ·8a6c109 (⌂)
         ├── ►:1[1]:A
-        │   └── ·62b409a (⌂|1)
-        │       ├── ►:3[2]:anon:
-        │       │   └── ·592abec (⌂|1)
+        │   └── ·62b409a (⌂)
+        │       ├── ►:4[2]:anon:
+        │       │   └── ·592abec (⌂)
         │       │       └── ►:7[3]:main
-        │       │           └── 🏁·965998b (⌂|1)
-        │       └── ►:4[2]:B
-        │           └── ·f16dddf (⌂|1)
+        │       │           └── 🏁·965998b (⌂)
+        │       └── ►:6[2]:B
+        │           └── ·f16dddf (⌂)
         │               └── →:7: (main)
         └── ►:2[1]:C
-            └── ·7ed512a (⌂|1)
-                ├── ►:5[2]:anon:
-                │   └── ·35ee481 (⌂|1)
+            └── ·7ed512a (⌂)
+                ├── ►:3[2]:anon:
+                │   └── ·35ee481 (⌂)
                 │       └── →:7: (main)
-                └── ►:6[2]:D
-                    └── ·ecb1877 (⌂|1)
+                └── ►:5[2]:D
+                    └── ·ecb1877 (⌂)
                         └── →:7: (main)
 
 "#]]
@@ -185,19 +183,19 @@ fn reachable_difference_returns_commits_in_traversal_order() -> anyhow::Result<(
 }
 
 #[test]
-fn explicit_traversal_tips_include_unnamed_revisions() -> anyhow::Result<()> {
+fn explicit_seeds_include_unnamed_revisions() -> anyhow::Result<()> {
     let (repo, meta) = read_only_in_memory_scenario("four-diamond")?;
     let merged_id = repo.rev_parse_single("merged")?.detach();
     let a_id = repo.rev_parse_single("A")?.detach();
     let c_id = repo.rev_parse_single("C")?.detach();
     let main_id = repo.rev_parse_single("main")?.detach();
 
-    let graph = Graph::from_commit_traversal_tips(
+    let graph = Graph::from_seeds(
         &repo,
         [
-            Tip::entrypoint(merged_id, None),
-            Tip::reachable(a_id, None),
-            Tip::reachable(c_id, None),
+            Seed::entrypoint(merged_id, None),
+            Seed::reachable(a_id, None),
+            Seed::reachable(c_id, None),
         ],
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
@@ -209,24 +207,24 @@ fn explicit_traversal_tips_include_unnamed_revisions() -> anyhow::Result<()> {
         graph_tree(&graph).to_string(),
         snapbox::str![[r#"
 
-└── 👉►:2[0]:merged[🌳]
-    └── ·8a6c109 (⌂|1)
-        ├── ►:0[1]:A
-        │   └── ·62b409a (⌂|1)
-        │       ├── ►:3[2]:anon:
-        │       │   └── ·592abec (⌂|1)
+└── 👉►:0[0]:merged[🌳]
+    └── ·8a6c109 (⌂)
+        ├── ►:1[1]:A
+        │   └── ·62b409a (⌂)
+        │       ├── ►:4[2]:anon:
+        │       │   └── ·592abec (⌂)
         │       │       └── ►:7[3]:main
-        │       │           └── 🏁·965998b (⌂|1)
-        │       └── ►:4[2]:B
-        │           └── ·f16dddf (⌂|1)
+        │       │           └── 🏁·965998b (⌂)
+        │       └── ►:6[2]:B
+        │           └── ·f16dddf (⌂)
         │               └── →:7: (main)
-        └── ►:1[1]:C
-            └── ·7ed512a (⌂|1)
-                ├── ►:5[2]:anon:
-                │   └── ·35ee481 (⌂|1)
+        └── ►:2[1]:C
+            └── ·7ed512a (⌂)
+                ├── ►:3[2]:anon:
+                │   └── ·35ee481 (⌂)
                 │       └── →:7: (main)
-                └── ►:6[2]:D
-                    └── ·ecb1877 (⌂|1)
+                └── ►:5[2]:D
+                    └── ·ecb1877 (⌂)
                         └── →:7: (main)
 
 "#]]
@@ -237,8 +235,12 @@ fn explicit_traversal_tips_include_unnamed_revisions() -> anyhow::Result<()> {
         ids_by_revs(&repo, &["merged", "C", "C^1", "C^2"])?
     );
     assert_eq!(
-        graph.find_merge_base_octopus_by_commit_id([a_id, c_id, merged_id])?,
-        Some(main_id)
+        graph.find_merge_base_octopus([
+            graph.segment_id_by_commit_id(a_id)?,
+            graph.segment_id_by_commit_id(c_id)?,
+            graph.segment_id_by_commit_id(merged_id)?,
+        ]),
+        Some(graph.segment_id_by_commit_id(main_id)?)
     );
 
     Ok(())
@@ -252,12 +254,12 @@ fn explicit_traversal_prioritizes_integrated_tips_independent_of_input_order() -
     let a_id = repo.rev_parse_single("A")?.detach();
     let main_id = repo.rev_parse_single("main")?.detach();
 
-    let graph = Graph::from_commit_traversal_tips(
+    let graph = Graph::from_seeds(
         &repo,
         [
-            Tip::entrypoint(merged_id, None),
-            Tip::reachable(a_id, None),
-            Tip::integrated(main_id, None),
+            Seed::entrypoint(merged_id, None),
+            Seed::reachable(a_id, None),
+            Seed::integrated(main_id, None),
         ],
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
@@ -269,47 +271,44 @@ fn explicit_traversal_prioritizes_integrated_tips_independent_of_input_order() -
         graph_tree(&graph).to_string(),
         snapbox::str![[r#"
 
-└── 👉►:2[0]:merged[🌳]
-    └── ·8a6c109 (⌂|1)
+└── 👉►:0[0]:merged[🌳]
+    └── ·8a6c109 (⌂)
         ├── ►:1[1]:A
-        │   └── ·62b409a (⌂|1)
-        │       ├── ►:3[2]:anon:
-        │       │   └── ·592abec (⌂|1)
-        │       │       └── ►:0[3]:main
-        │       │           └── 🏁·965998b (⌂|✓|1)
-        │       └── ►:4[2]:B
-        │           └── ·f16dddf (⌂|1)
-        │               └── →:0: (main)
-        └── ►:5[1]:C
-            └── ·7ed512a (⌂|1)
-                ├── ►:6[2]:anon:
-                │   └── ·35ee481 (⌂|1)
-                │       └── →:0: (main)
-                └── ►:7[2]:D
-                    └── ·ecb1877 (⌂|1)
-                        └── →:0: (main)
+        │   └── ·62b409a (⌂)
+        │       ├── ►:4[2]:anon:
+        │       │   └── ·592abec (⌂)
+        │       │       └── ►:7[3]:main
+        │       │           └── 🏁·965998b (⌂|✓)
+        │       └── ►:6[2]:B
+        │           └── ·f16dddf (⌂)
+        │               └── →:7: (main)
+        └── ►:2[1]:C
+            └── ·7ed512a (⌂)
+                ├── ►:3[2]:anon:
+                │   └── ·35ee481 (⌂)
+                │       └── →:7: (main)
+                └── ►:5[2]:D
+                    └── ·ecb1877 (⌂)
+                        └── →:7: (main)
 
 "#]]
     );
 
-    let (main_seg, main) = graph
+    let (_main_seg, main) = graph
         .segment_and_commit_by_ref_name(ref_name("refs/heads/main")?.as_ref())
         .expect("main segment");
+    // Segment ids are builder-assigned (the snapshot above pins them); what matters is that
+    // integrated tips are queued before reachable tips so their flags propagate.
     assert!(
         main.flags.contains(CommitFlags::Integrated),
         "integrated tips should be queued before reachable tips even if the caller provides them last"
-    );
-    assert_eq!(
-        main_seg.id.index(),
-        0,
-        "schedule first, hence the first node"
     );
 
     Ok(())
 }
 
 #[test]
-fn relation_between_handles_identity_and_disjoint_segments() -> anyhow::Result<()> {
+fn merge_base_handles_identity_and_disjoint_segments() -> anyhow::Result<()> {
     let (repo, meta) = read_only_in_memory_scenario("four-diamond")?;
     let mut graph = Graph::from_head(
         &repo,
@@ -321,19 +320,12 @@ fn relation_between_handles_identity_and_disjoint_segments() -> anyhow::Result<(
 
     let main = segment_id_by_ref_name(&graph, "refs/heads/main")?;
     let a = segment_id_by_ref_name(&graph, "refs/heads/A")?;
-    assert_eq!(
-        graph.relation_between(main, main),
-        SegmentRelation::Identity
-    );
+    assert_eq!(graph.find_merge_base(main, main), Some(main));
 
     let orphan = graph.insert_segment(Segment {
-        generation: 0,
         ..Default::default()
     });
-    assert_eq!(
-        graph.relation_between(main, orphan),
-        SegmentRelation::Disjoint
-    );
+    assert_eq!(graph.find_merge_base(main, orphan), None);
     assert_eq!(graph.find_merge_base_octopus([main, orphan]), None);
     assert_eq!(graph.find_merge_base_octopus([main, orphan, a]), None);
 
@@ -356,34 +348,19 @@ fn merge_base_apis_can_resolve_segments_by_first_commit_id() -> anyhow::Result<(
     let c = segment_id_by_ref_name(&graph, "refs/heads/C")?;
     let main = segment_id_by_ref_name(&graph, "refs/heads/main")?;
 
-    let merged_id = graph[merged].tip().expect("commit");
-    let a_id = graph[a].tip().expect("commit");
-    let c_id = graph[c].tip().expect("commit");
-    let main_id = graph[main].tip().expect("commit");
-
-    assert_eq!(
-        graph.relation_between_by_commit_id(a_id, merged_id)?,
-        SegmentRelation::Ancestor
-    );
-    assert_eq!(
-        graph.find_merge_base_by_commit_id(merged_id, a_id)?,
-        Some(a_id)
-    );
-    assert_eq!(
-        graph.find_merge_base_octopus_by_commit_id([a_id, c_id, merged_id])?,
-        Some(main_id)
-    );
+    assert_eq!(graph.find_merge_base(merged, a), Some(a));
+    assert_eq!(graph.find_merge_base_octopus([a, c, merged]), Some(main));
 
     assert!(
         graph
-            .find_merge_base_by_commit_id(repo.object_hash().null(), main_id)
+            .segment_id_by_commit_id(repo.object_hash().null())
             .is_err()
     );
 
     Ok(())
 }
 
-fn segment_id_by_ref_name(graph: &Graph, name: &str) -> anyhow::Result<SegmentIndex> {
+fn segment_id_by_ref_name(graph: &Graph, name: &str) -> anyhow::Result<usize> {
     let full_name = ref_name(name)?;
     graph
         .segment_by_ref_name(full_name.as_ref())

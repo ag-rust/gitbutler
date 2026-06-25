@@ -2416,6 +2416,7 @@ mod util {
             commits_on_remote.push(commit(id, None))
         }
         StackSegment {
+            name_projected_from_outside: false,
             ref_info,
             remote_tracking_ref_name: None,
             sibling_segment_id: None,
@@ -2424,7 +2425,6 @@ mod util {
             commits,
             commits_outside: None,
             base,
-            base_segment_id: None,
             commits_by_segment: Vec::new(),
             commits_on_remote,
             metadata: None,

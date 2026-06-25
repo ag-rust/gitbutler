@@ -1,44 +1,46 @@
 //! A graph data structure for seeing the Git commit graph as segments.
 //!
-//! This crate is part of the Correctness and Stability initiative.
+//! ### The pipeline
 //!
-//! ### Before the Graph
+//! Everything in this crate flows through one pipeline with a single substrate, the
+//! [`CommitGraph`]:
 //!
-//! The application traditionally displays commits in lanes while allowing them to be segmented. Today a lane is a
-//! stack of segments. This is great for users as it's easy to understand, but there is a problem with it: it's a complete lie.
+//! ```text
+//! repository ──walk──▶ CommitGraph ──build──▶ Graph (segments) ──project──▶ Workspace
+//!                          ▲                                                     │
+//!                          └───────────── but-rebase edits ◀────────────────────┘
+//! ```
 //!
-//! To generate stacks, one performed a graph traversal, following only the first parent, down to the merge-base of the workspace
-//! commit with the target branch. It's clear how this degenerates information especially around merges that the application
-//! helps to create by allowing to merge with the target branch.
+//! * **walk** ([`walk`], entered through [`Graph::from_head`] and [`Graph::from_tip`]): the
+//!   traversal seeds from `HEAD`, the workspace ref, the target, and the stack branches; obeys
+//!   goals and limits; propagates flags; and accumulates the [`CommitGraph`] — an arena of
+//!   commits with ordered parent arrays, the connectivity the traversal actually followed, and
+//!   every encountered ref attached as data.
+//! * **build** (the private `build` module, entered through [`graph_from_repository`]):
+//!   gather-then-build. Pure fact and planning passes decide the full segment structure as
+//!   data — boundaries, chains from workspace metadata, the name lifecycle, the stored
+//!   [`ref_layout`] — then materialization mints the segment [`Graph`] in its final shape.
+//!   Segments are FINAL at creation: commits, names, connections and endpoints never change
+//!   afterwards; only link-level fields (sibling and remote-tracking links) are filled in by
+//!   later passes.
+//! * **project** ([`workspace`], entered through [`Graph::into_workspace`]): the application
+//!   view — stacks of first-parent chains of segments, with integration status against the
+//!   target. Projections are lossy; they carry links back to the segments they came from.
+//! * **edit** (`but-rebase`): the editor is created FROM the [`CommitGraph`] (mutability follows
+//!   reachability), and an edited commit graph re-enters the same build via
+//!   [`workspace_from_commit_graph`] — edit previews and fresh walks share one code path.
+//!   `but-workspace` sits on top of both as the operations layer.
 //!
-//! When trying to rebase the workspace onto updated target branches though, it still exclusively operates in stacks, ignoring
-//! the complexities of the underlying graph, and the illusion starts to break down.
-//!
-//! Besides that, there is an inherent mental issue when programming with data structures that degenerate information, as the
-//! resulting program will inherently be unfit for the task as it's based on over-simplified assumptions baked into its very core.
-//!
-//! With the current data structures, achieving correctness simply isn't possible.
-//!
-//! ### The Graph - the Solution
-//!
-//! The graph solves this problem by simplifying the commit-graph and optimizing it for traversal, without oversimplifying the
-//! underlying commit-graph. That way, the notion of stacks with segments is merely a view of the graph specifically prepared
-//! for presentation.
-//!
-//! When operations are supposed to be performed, we can now do things like this `git rebase --preserve-merges origin/main`,
-//! creating a correctly ordered list of operations to do the transplantation correctly. Thanks to the additional metadata
-//! collected into the Graph I'd expect us to be able to whatever it takes without limitation.
-//!
-//! Besides that, operating on a graph, despite its own complexities, is finally aligning the mental model of the programmer
-//! with what's actually there, for algorithms suitable to perform the job correctly.
-//!
-//! All this makes the Graph the **new core data-structure** that is the world of GitButler and upon which visualizations and
-//! mutation operations are based.
+//! The segment view exists because stacks alone degenerate information: a first-parent walk to
+//! the merge-base flattens exactly the merges the application helps create. The [`Graph`] keeps
+//! that shape for display — segments own their outgoing [`Connection`]s, and a stack is merely
+//! a projection of it — while the [`CommitGraph`] underneath stays the record everything is
+//! derived from and every edit is applied to.
 //!
 //! ### New Workspace Concepts
 //!
 //! The workspace is merely a projection of *The Graph*, and as such is mostly useful for display and user interaction.
-//! In the end it boils down to passing commit-hashes, or [segment-ids](SegmentIndex) at most.
+//! In the end it boils down to passing commit-hashes, or plain-`usize` segment ids at most.
 //!
 //! The workspace has been redesigned from the ground up for flexibility, enabling new user-experiences. To help thinking
 //! about these, a few new concepts will be good to know about.
@@ -56,14 +58,14 @@
 //! This is particularly relevant in open-ended traversals outside of workspaces, they can go on until the end of history,
 //! literally.
 //!
-//! For that reason, whenever a commit isn't the end of the graph, but the end traversal as a [limit was hit](init::Options::with_limit_hint),
+//! For that reason, whenever a commit isn't the end of the graph, but the end traversal as a [limit was hit](walk::Options::with_limit_hint),
 //! it will be flagged as such.
 //!
 //! This way one can visualize such Early Ends, and allow the user to extend the traversal selectively the next time it
 //! is performed.
 //!
 //! Despite that, one has to learn how to deal with possible huge graphs, and possible workspaces with a lot of commits,
-//! and [a hard limit](init::Options::with_hard_limit()) as long as downstream cannot deal with this on their own.
+//! and [a hard limit](walk::Options::with_hard_limit()) as long as downstream cannot deal with this on their own.
 //!
 //! #### Managed Workspaces, and unmanaged ones
 //!
@@ -77,7 +79,7 @@
 //! #### Optional Targets
 //!
 //! Even on *Managed Workspaces*, target references are now optional. This makes it possible to have a workspace that doesn't
-//! know if it's integrated or not. These are the reason a [soft limit](init::Options::with_limit_hint()) must always be set
+//! know if it's integrated or not. These are the reason a [soft limit](walk::Options::with_limit_hint()) must always be set
 //! to assure the traversal doesn't fetch the entire Git history.
 //!
 //! This, however, also means that the workspace creation doesn't have to be interrupted by a "what's your target" prompt anymore.
@@ -87,7 +89,7 @@
 //!
 //! For convenience, various boolean parameters have been aggregated into [bitflags](Commit::flags). Thanks to the way *The Graph*
 //! is traversed, we know that the first commit of any [graph segment](Segment) will always bear the flags that are also used by every other commit
-//! contained within it. Thus, [segment flags](Segment::non_empty_flags_of_first_commit()) are equivalent to the flags of
+//! contained within it. Thus, a segment's flags (`Segment::non_empty_flags_of_first_commit()`) are equivalent to the flags of
 //! their first commit.
 //!
 //! The same is *not* true for [stack segments](workspace::StackSegment), i.e. segments within a [workspace projection](Workspace).
@@ -96,43 +98,31 @@
 //!
 //! #### The 'frozen' Commit-Flag
 //!
-//! Commits now have a new state that tells for each if it is reachable by *any* remote, and further, if it's reachable
-//! by the remote configured for *their segment*.
+//! [`CommitFlags::NotInRemote`] marks commits NOT reachable from any remote-seeded tip. The
+//! workspace projection inverts it into
+//! [`StackCommitFlags::ReachableByRemote`](workspace::StackCommitFlags): commits others may
+//! already have observed, to be treated as frozen and not manipulated casually.
 //!
-//! This additional partitioning could be leveraged for enhanced user experiences.
-//!
-//! ### The Graph - Traversal and more
-//!
-//! There are three distinct steps to processing the git commit-graph into more usable forms.
-//!
-//! * **traversal**
-//!     - walk the git commit graph to produce a segmented graph, which assigns commits to segments,
-//!       but also splits segments on incoming and multiple outgoing connections.
-//! * **reconciliation**
-//!     - a post-processing step which adds workspace metadata into the segmented graph, as such information
-//!       can't be held in the commit-graph itself.
-//! * **projection**
-//!     - transform the segmented and reconciled graph into a view that is application-specific, i.e. see
-//!       stacks of first-parent traversed named segments.
+//! ### Build decisions
 //!
 //! #### Commits are owned by Segments
 //!
 //! A commit can only be owned by a single segment. Thus, there are empty *named* segments which point at other segments,
 //! effectively representing a reference.
-//! Which of these references gets to own a commit depends on the traversal logic, or can be the result of *Reconciliation*.
+//! Which of these references gets to own a commit is a *planning* decision.
 //!
-//! #### Reconciliation
+//! #### Planning chains from metadata
 //!
-//! *The Graph* is created from traversing the Git commit graph. Thus, information that is not contained in it has to be
-//! reconciled with *what was actually traversed*.
+//! *The Graph* is created from traversing the Git commit graph. Thus, information that is not contained in it,
+//! like workspace metadata, has to shape the segmented graph as it is built.
 //!
-//! Nonetheless, we can create *stacks* as independent branches and dependent branches inside of them without having
+//! That way, we can create *stacks* as independent branches and dependent branches inside of them without having
 //! a single commit to differentiate their respective branches from each other.
 //!
 //! Imagine a repository with a single commit `73a30f8` with the following Git references pointing to it: `gitbutler/workspace`,
 //! `stack1-segment1`, `stack1-segment2`, `stack2-segment1`, and `refs/remotes/origin/main`.
 //!
-//! Right after traversal, a Graph would look like this:
+//! A naive segmentation of the traversal would look like this:
 //!
 //! ```text
 //!   ┌────────────────────┐
@@ -150,14 +140,12 @@
 //! └────────────────────────┘
 //! ```
 //!
-//! This is due to `gitbutler/workspace` finding `73a30f8` first, with `origin/main` arriving later, pointing to the
-//! first commit in `gitbutler/workspace` effectively. The other references aren't participating in the traversal.
+//! This is because `gitbutler/workspace` owns `73a30f8`, with `origin/main` merely pointing to
+//! that commit; the other references would be plain refs on it.
 //!
-//! The tip that finds the commit first is dependent on various factors, and it could also happen that `origin/main` finds
-//! it first. In any case, this needs to be adjusted after traversal in the process called *reconciliation*, so the graph
-//! matches what our [workspace metadata](but_core::ref_metadata::Workspace::stacks) says it should be.
-//!
-//! After reconciling, the graph would become this:
+//! The chain plan instead reads [workspace metadata](but_core::ref_metadata::Workspace::stacks) before any
+//! segment exists and decides which refs form chains of empty segments. Materialization then mints this
+//! shape directly:
 //!
 //! ```text
 //! ┌───────────────────┐
@@ -192,15 +180,14 @@
 //! #### Projection
 //!
 //! A projection is a mapping of the segmented graph to any shape an application needs, and for any purpose.
-//! It cannot be stressed enough that the source of truth for all commit-graph manipulation must be the segmented graph,
-//! as projections are inherently lossy.
-//! Thus, it's useful create projects with links back to the segments that the information was extracted from.
+//! Projections are inherently lossy, so they carry links back to the segments the information was
+//! extracted from — and manipulation never operates on a projection: the rebase editor edits the
+//! [`CommitGraph`], and re-building from the edited substrate yields the next segment graph and
+//! its projections.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 mod segment;
-/// Use this for basic types like [`petgraph::Direction`], and graph algorithms.
-pub use petgraph;
 pub use segment::{
     Commit, CommitFlags, RefInfo, Segment, SegmentFlags, SegmentMetadata, StopCondition, Worktree,
     WorktreeKind,
@@ -209,13 +196,28 @@ pub use segment::{
 mod api;
 pub use api::FirstParent;
 /// Produce a graph from a Git repository.
-pub mod init;
+pub mod walk;
 
 #[path = "projection/mod.rs"]
 pub mod workspace;
 pub use workspace::workspace::Workspace;
 
 mod utils;
+
+mod segment_graph;
+/// The segment graph, where segments directly own their outgoing connections.
+pub use segment_graph::{Connection, Direction};
+
+/// The commit-first graph flattened out of the raw traversal — the substrate every graph build
+/// starts from. See the module docs.
+mod commit_graph;
+pub use commit_graph::{CommitGraph, CommitNode};
+/// The graph builders: derive the segment [`Graph`] from a [`CommitGraph`]. See the module docs.
+mod build;
+/// The metadata-driven ref placement table stored on the commit graph. See the module docs.
+pub mod ref_layout;
+pub use build::{graph_from_repository, workspace_from_commit_graph, workspace_from_repository};
+pub(crate) use build::{graph_from_repository_seeds, graph_from_repository_unmanaged};
 
 mod statistics;
 pub use statistics::Statistics;
@@ -227,10 +229,18 @@ mod debug;
 pub type CommitIndex = usize;
 
 /// A graph of connected segments that represent a section of the actual commit-graph.
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Clone)]
 #[must_use]
 pub struct Graph {
-    inner: init::PetGraph,
+    /// The segment arena: index = segment id. Removing a segment tombstones its slot, which is
+    /// reused (LIFO) before a fresh id is handed out, so segment ids stay stable across
+    /// construction-time surgery.
+    pub(crate) segments: Vec<Option<Segment>>,
+    /// The maintained reverse index: index = target segment; one source entry per connection.
+    /// Kept in sync by the edge methods so per-segment incoming queries are O(degree).
+    pub(crate) incoming: Vec<Vec<usize>>,
+    /// Tombstoned arena slots, reused LIFO.
+    pub(crate) free: Vec<usize>,
     /// From where the graph was created. This is useful if one wants to focus on a subset of the graph.
     ///
     /// This is `None` only for a freshly default-initialized graph, or while a graph is being assembled before
@@ -243,33 +253,21 @@ pub struct Graph {
     /// Post-processing may move the entrypoint to an empty synthetic segment, for example a named workspace ref
     /// without a workspace commit. The segment still marks the ref's place in the graph, but it has no local
     /// commit slot that can hold the ref target. In that case the commit id is kept here so
-    /// [`Graph::redo_traversal_with_overlay()`] can keep using the original traversal tip if the ref can no
+    /// [`Graph::redo_traversal()`] can keep using the original traversal seed if the ref can no
     /// longer be resolved in the overlay/repository.
-    entrypoint: Option<(SegmentIndex, EntryPointCommit)>,
+    entrypoint: Option<(usize, EntryPointCommit)>,
     /// The ref_name used when starting the graph traversal. It is set to help assure that the entrypoint stays
-    /// on the correctly named segment, knowing that the post-process may alter segments quite substantially
-    /// when crating independent and dependent branches.
+    /// on the correctly named segment, as chain creation can splice empty segments for independent and
+    /// dependent branches around the entrypoint's position.
     entrypoint_ref: Option<gix::refs::FullName>,
-    /// Effective initial traversal tips, in segment creation order.
-    ///
-    /// These are the caller-provided tips plus option-derived tips after
-    /// validation, deduplication, and queue-order normalization. Segment ids are
-    /// intentionally not stored here: post-processing can split, delete, and
-    /// reconnect segments, so consumers re-resolve each tip by commit id against
-    /// the final graph shape and filter for the roles they need.
-    traversal_tips: Vec<init::Tip>,
-    /// Ad-hoc/single-branch local branch orders read from metadata while post-processing.
-    ///
-    /// These are kept on the graph so projection can tell the difference between
-    /// an ordinary ad-hoc lower-bound branch and the bottom branch of a
-    /// GitButler-created dependent branch chain.
+    /// The validated snapshot of [`branch_stack_order`](but_core::RefMetadata::branch_stack_order)
+    /// for the entrypoint ref: the tip-to-base branch chains GitButler created in
+    /// ad-hoc/single-branch mode, filtered at build time to refs that still exist.
     ad_hoc_branch_stack_orders: Vec<Vec<gix::refs::FullName>>,
-    /// It's `true` only if we have stopped the traversal due to a hard limit.
-    hard_limit_hit: bool,
     /// The options used to create the graph, which allows it to regenerate itself after something
     /// possibly changed. This can also be used to simulate changes by injecting would-be information.
-    /// Public to be able to change it before calling [Graph::redo_traversal_with_overlay()].
-    pub options: init::Options,
+    /// Public to be able to change it before calling [Graph::redo_traversal()].
+    pub options: walk::Options,
     /// Project-wide metadata used for target ref, target commit, and push remote resolution.
     pub project_meta: but_core::ref_metadata::ProjectMeta,
     /// All remote names that aren't URLs and that were retrieved during the traversal.
@@ -277,11 +275,44 @@ pub struct Graph {
     /// They are useful to extract remote names from remote tracking refs like `refs/remotes/origin/master`,
     /// which may have slashes in them.
     pub symbolic_remote_names: Vec<String>,
+    /// The local → remote tracking-branch relationships the builder derived from the repository
+    /// (git-configured bindings plus name-deduction against the workspace's symbolic remotes).
+    /// Carried so consumers resolve tracking relationships as data instead of navigating
+    /// segment links. Empty for graphs not born from the CommitGraph builders.
+    pub(crate) remote_tracking: std::collections::HashMap<gix::refs::FullName, gix::refs::FullName>,
+    /// The commit graph this segment graph was assembled from — the commit-addressed substrate
+    /// consumers migrate to as the segment view winds down. It is also the record for traversal
+    /// carries (hard-limit signal, seed tips). Empty (default) only for graphs not born from
+    /// the CommitGraph builders (defaults, hand-assembled test graphs).
+    pub(crate) commit_graph: CommitGraph,
+}
+
+/// Like the derived implementation, but omitting the carried [`CommitGraph`] (the debug dump
+/// documents the segment view, and the substrate has its own renderers) and the `incoming`
+/// index (derived from the connections and only noise in snapshots).
+impl std::fmt::Debug for Graph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Graph")
+            .field("segments", &self.segments)
+            .field("free", &self.free)
+            .field("entrypoint", &self.entrypoint)
+            .field("entrypoint_ref", &self.entrypoint_ref)
+            .field("seeds", &self.seeds())
+            .field(
+                "ad_hoc_branch_stack_orders",
+                &self.ad_hoc_branch_stack_orders,
+            )
+            .field("hard_limit_hit", &self.hard_limit_hit())
+            .field("options", &self.options)
+            .field("project_meta", &self.project_meta)
+            .field("symbolic_remote_names", &self.symbolic_remote_names)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum EntryPointCommit {
-    /// The traversal tip is known.
+    /// The traversal seed is known.
     ///
     /// This is an object id rather than a synthetic index because an empty entrypoint segment has no commit slot
     /// to index into, nor is it reliably reachable by traversing the graph. If the commit is present in the
@@ -315,13 +346,13 @@ impl EntryPointCommit {
 impl Graph {
     /// Return the entrypoint as a segment plus the optional position of its tip commit in that segment.
     ///
-    /// The graph stores the tip as an object id so it survives post-processing that moves the entrypoint to
-    /// an empty or otherwise synthetic segment. Some graph-local consumers, like debug rendering and
+    /// The graph stores the tip as an object id so it stays valid when chain creation places the entrypoint
+    /// on an empty or otherwise synthetic segment. Some graph-local consumers, like debug rendering and
     /// statistics, still need the segment-relative commit position to mark where the entrypoint appears in
     /// the current graph shape, so it is derived here instead of being stored as mutable state.
-    fn entrypoint_location(&self) -> Option<(SegmentIndex, Option<CommitIndex>)> {
+    fn entrypoint_location(&self) -> Option<(usize, Option<CommitIndex>)> {
         let (segment_index, commit) = self.entrypoint?;
-        let segment = self.inner.node_weight(segment_index)?;
+        let segment = self.segment(segment_index)?;
         Some((segment_index, commit.index_in(segment)))
     }
 }
@@ -334,8 +365,8 @@ pub struct EntryPoint<'graph> {
     pub segment: &'graph Segment,
     /// If present, the commit that started traversal and the segment that owns it.
     ///
-    /// This can differ from [`Self::segment`] when post-processing moved the entrypoint to an
-    /// empty synthetic segment, such as a virtual workspace tip segment.
+    /// This can differ from [`Self::segment`] when the entrypoint sits on an empty synthetic
+    /// segment, such as a virtual workspace tip segment, while the commit lives below it.
     ///
     /// May be `None` if the entrypoint was a reference in a newly born repository,
     /// which doesn't have any commits.
@@ -348,84 +379,3 @@ impl<'graph> EntryPoint<'graph> {
         self.commit_and_owner.map(|(c, _)| c)
     }
 }
-
-/// Relationship of one segment to another in terms of graph ancestry.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum SegmentRelation {
-    /// Both segment indices point to the same segment.
-    Identity,
-    /// The first segment is an ancestor of the second segment.
-    Ancestor,
-    /// The first segment is a descendant of the second segment.
-    Descendant,
-    /// Segments share history, but neither is ancestor of the other.
-    Diverged,
-    /// Segments do not share any history.
-    Disjoint,
-}
-
-/// This structure is used as data associated with each edge and is mainly for collecting
-/// the intent of an edge, which should always represent the connection of a commit to another.
-/// Sometimes, it represents the connection from a commit (or segment) to an empty segment which
-/// doesn't yet have a commit.
-/// The idea is to write code that keeps edge information consistent, and our visualization tools highlights
-/// issues with the inherent invariants.
-#[derive(Debug, Copy, Clone)]
-pub struct Edge {
-    /// `None` if the source segment has no commit.
-    src: Option<CommitIndex>,
-    /// The commit id at `src` in the segment commit list.
-    src_id: Option<gix::ObjectId>,
-    dst: Option<CommitIndex>,
-    /// The commit id at `dst` in the segment commit list.
-    dst_id: Option<gix::ObjectId>,
-    /// The position of this edge's destination among the source commit's parents.
-    /// For a merge commit with parents `[A, B]`, the edge to `A` has `parent_order = 0`
-    /// and the edge to `B` has `parent_order = 1`.
-    /// Deliberately not `usize`: `Edge` is stored in every petgraph edge slot,
-    /// and widening this field pushes hot edge storage over an important size boundary.
-    ///
-    /// This limit would only be reached if there is a merge with 4.3 billion commits.
-    pub(crate) parent_order: u32,
-}
-
-impl Edge {
-    /// Return the 0-based position of this edge's destination among the source commit's parents.
-    /// For instance, if the source is a merge commit and this edge represents the connection
-    /// to the second parent, the output will be `Some(1)`.
-    ///
-    /// This is `None` when the edge does not point at a concrete destination commit.
-    /// That happens for synthetic graph structure such as empty virtual segments,
-    /// where there is no Git commit parent for this edge to identify.
-    pub fn parent_order(&self) -> Option<u32> {
-        self.dst_id.map(|_| self.parent_order)
-    }
-
-    /// Useful when reusing an edge to assure it doesn't list commits that don't exist in `src_idx` and `dst_idx` anymore.
-    pub(crate) fn adjusted_for(
-        mut self,
-        src_sidx: SegmentIndex,
-        dst_sidx: SegmentIndex,
-        graph: &init::PetGraph,
-    ) -> Self {
-        let commits = &graph[src_sidx].commits;
-        let (id, idx) = commits
-            .last()
-            .map(|c| (Some(c.id), Some(commits.len() - 1)))
-            .unwrap_or_default();
-        self.src_id = id;
-        self.src = idx;
-
-        let commits = &graph[dst_sidx].commits;
-        let (id, idx) = commits
-            .first()
-            .map(|c| (Some(c.id), Some(0)))
-            .unwrap_or_default();
-        self.dst_id = id;
-        self.dst = idx;
-
-        self
-    }
-}
-/// An index into the [`Graph`].
-pub type SegmentIndex = petgraph::graph::NodeIndex;

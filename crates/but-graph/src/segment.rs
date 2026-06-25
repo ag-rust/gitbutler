@@ -2,7 +2,7 @@ use bitflags::bitflags;
 use bstr::{BString, ByteSlice};
 use but_core::ref_metadata::MaybeDebug;
 
-use crate::{CommitIndex, Graph, SegmentIndex};
+use crate::{CommitIndex, Graph};
 
 /// A commit with must useful information extracted from the Git commit itself.
 #[derive(Clone, Eq, PartialEq)]
@@ -18,17 +18,7 @@ pub struct Commit {
     pub refs: Vec<RefInfo>,
 }
 
-impl Commit {
-    /// Return an iterator over all reference names that point to this commit.
-    pub fn ref_name_iter(&self) -> impl Iterator<Item = &gix::refs::FullName> + Clone {
-        self.refs.iter().map(|ri| &ri.ref_name)
-    }
-
-    /// Return information about the reference that matches `name`.
-    pub fn ref_by_name(&self, name: &gix::refs::FullNameRef) -> Option<&RefInfo> {
-        self.refs.iter().find(|ri| ri.ref_name.as_ref() == name)
-    }
-}
+impl Commit {}
 
 /// A structure to inform about a reference which was present at a commit.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -157,7 +147,7 @@ bitflags! {
         /// Traversal stopped before following parents due to configured traversal limits.
         ///
         /// If this was a *hard* limit, the graph may not contain all the *interesting* portions of the commit-graph,
-        /// see [`hard_limit`](crate::init::Options::hard_limit)
+        /// see [`hard_limit`](crate::walk::Options::hard_limit)
         const Limit = 1 << 0;
         /// Traversal reached the first commit in history, which has no parents, and is an orphan.
         /// There can be more than one in one graph if unrelated histories were merged.
@@ -184,14 +174,14 @@ impl StopCondition {
     }
 
     /// Return `true` if traversal stopped because the configured traversal limit was reached.
-    pub fn at_limit(&self) -> bool {
+    pub(crate) fn at_limit(&self) -> bool {
         self.contains(StopCondition::Limit)
     }
 
     /// Return `true` if traversal stopped due to an artificial boundary, not because history naturally ended.
     ///
     /// This also means that the traversal would have continued otherwise.
-    pub fn is_unnatural(&self) -> bool {
+    pub(crate) fn is_unnatural(&self) -> bool {
         self.intersects(StopCondition::Limit | StopCondition::ShallowBoundary)
     }
 }
@@ -242,7 +232,7 @@ bitflags! {
 
 impl CommitFlags {
     /// The amount of goals that were tracked, i.e. 0 if there is no goal, or N if there are N goal.
-    pub fn num_goals(&self) -> usize {
+    pub(crate) fn num_goals(&self) -> usize {
         let goals = self.bits() & !Self::all().bits();
         if goals == 0 {
             0
@@ -288,11 +278,7 @@ impl CommitFlags {
 pub struct Segment {
     /// An ID which can uniquely identify this segment among all segments within the graph that owned it.
     /// Note that it's not suitable to permanently identify the segment, so should not be persisted.
-    pub id: SegmentIndex,
-    /// A non-null number, and starting at `1`, to indicate how high up the segment is in the graph past the root nodes.
-    /// Thus, higher numbers mean they are further down.
-    /// If `0`, this is a root node, i.e. one without any incoming connections.
-    pub generation: usize,
+    pub id: usize,
     /// The unambiguous or disambiguated name of the branch *or tag* at the tip of the segment, i.e. at the first commit,
     /// along with its worktree if one happens to point at it.
     ///
@@ -313,11 +299,11 @@ pub struct Segment {
     /// the segment id of the local tracking branch, effectively doubly-linking them for ease of traversal.
     /// If `ref_name` is `None` and this segment is the ancestor of a named segment that is known to a workspace,
     /// this id is pointing to that named segment to allow the reconstruction of the originally desired workspace.
-    pub sibling_segment_id: Option<SegmentIndex>,
+    pub sibling_segment_id: Option<usize>,
     /// If `remote_tracking_ref_name` is set, this field is also set to make accessing the respective segment easy,
     /// avoiding a search through the entire graph.
     /// It *only* ever points to the remote tracking branch segment.
-    pub remote_tracking_branch_segment_id: Option<SegmentIndex>,
+    pub remote_tracking_branch_segment_id: Option<usize>,
     /// The portion of commits that can be reached from the tip of the *branch* downwards, so that they are unique
     /// for that stack segment and not included in any other stack or stack segment.
     ///
@@ -325,6 +311,9 @@ pub struct Segment {
     pub commits: Vec<Commit>,
     /// Read-only metadata with additional information, or `None` if nothing was present.
     pub metadata: Option<SegmentMetadata>,
+    /// Outgoing connections to other segments, in first-parent order. The segment *is* the graph:
+    /// these are the edges that used to live in a separate graph container.
+    pub connections: Vec<crate::Connection>,
 }
 
 /// Metadata for segments, which are either dedicated branches or represent workspaces.
@@ -355,8 +344,8 @@ impl Segment {
     ///
     /// The sibling id is graph-local, so the lookup must happen in the `graph`
     /// that owns this segment.
-    pub fn sibling_segment<'graph>(&self, graph: &'graph Graph) -> Option<&'graph Segment> {
-        graph.inner.node_weight(self.sibling_segment_id?)
+    pub(crate) fn sibling_segment<'graph>(&self, graph: &'graph Graph) -> Option<&'graph Segment> {
+        graph.segment(self.sibling_segment_id?)
     }
 
     /// Return the top-most commit id of the segment.
@@ -365,7 +354,7 @@ impl Segment {
     }
 
     /// Return the index of the last (present) commit, or `None` if there is no commit stored in this segment.
-    pub fn last_commit_index(&self) -> Option<usize> {
+    pub(crate) fn last_commit_index(&self) -> Option<usize> {
         self.commits.len().checked_sub(1)
     }
 
@@ -378,18 +367,18 @@ impl Segment {
     }
 
     /// Find the commit associated with the given `commit_index`, which for convenience is optional.
-    pub fn commit_id_by_index(&self, idx: Option<CommitIndex>) -> Option<gix::ObjectId> {
+    pub(crate) fn commit_id_by_index(&self, idx: Option<CommitIndex>) -> Option<gix::ObjectId> {
         self.commits.get(idx?).map(|c| c.id)
     }
 
     /// Find the commit with the given `id` in the commits of this segment.
-    pub fn commit_by_id(&self, id: gix::ObjectId) -> Option<&Commit> {
+    pub(crate) fn commit_by_id(&self, id: gix::ObjectId) -> Option<&Commit> {
         self.commits.iter().find(|c| c.id == id)
     }
 
     /// Return the flags of the first commit if non-empty, which is the top-most commit in the stack assuming
     /// it grows upwards into the future.
-    pub fn non_empty_flags_of_first_commit(&self) -> Option<CommitFlags> {
+    pub(crate) fn non_empty_flags_of_first_commit(&self) -> Option<CommitFlags> {
         let commit = self.commits.first()?;
         (!commit.flags.is_empty()).then_some(commit.flags)
     }
@@ -411,17 +400,16 @@ impl std::fmt::Debug for Segment {
         if f.alternate() {
             let Segment {
                 ref_info,
-                generation,
                 id,
                 commits,
                 remote_tracking_ref_name,
                 sibling_segment_id,
                 remote_tracking_branch_segment_id,
                 metadata,
+                connections,
             } = self;
             f.debug_struct("Segment")
                 .field("id", id)
-                .field("generation", generation)
                 .field(
                     "ref_info",
                     &MaybeDebug(&ref_info.as_ref().map(|ri| ri.debug_string())),
@@ -432,14 +420,14 @@ impl std::fmt::Debug for Segment {
                 )
                 .field(
                     "sibling_segment_id",
-                    &MaybeDebug(&sibling_segment_id.as_ref().map(|id| id.index().to_string())),
+                    &MaybeDebug(&sibling_segment_id.as_ref().map(|id| id.to_string())),
                 )
                 .field(
                     "remote_tracking_branch_segment_id",
                     &MaybeDebug(
                         &remote_tracking_branch_segment_id
                             .as_ref()
-                            .map(|id| id.index().to_string()),
+                            .map(|id| id.to_string()),
                     ),
                 )
                 .field("commits", &commits)
@@ -451,6 +439,7 @@ impl std::fmt::Debug for Segment {
                         Some(SegmentMetadata::Workspace(m)) => m,
                     },
                 )
+                .field("connections", &connections)
                 .finish()
         } else {
             f.debug_struct(

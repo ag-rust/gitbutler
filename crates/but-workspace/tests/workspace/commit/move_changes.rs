@@ -22,7 +22,7 @@ fn visualize_tree(id: gix::Id<'_>) -> String {
 
 #[test]
 fn move_changes_same_commit_is_noop() -> Result<()> {
-    let (_tmp, graph, repo, mut _meta, _description) =
+    let (_tmp, ws, repo, mut _meta, _description) =
         writable_scenario("reword-three-commits", |_| {})?;
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -35,8 +35,12 @@ fn move_changes_same_commit_is_noop() -> Result<()> {
     );
 
     let commit_id = repo.rev_parse_single("three")?.detach();
-    let mut ws = graph.into_workspace()?;
-    let editor = Editor::create(&mut ws, &mut _meta, &repo)?;
+    let editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut _meta,
+        &repo,
+    )?;
 
     // Moving changes from a commit to itself should be a no-op
     let outcome =
@@ -61,7 +65,7 @@ fn move_changes_same_commit_is_noop() -> Result<()> {
 
 #[test]
 fn move_file_from_head_to_parent() -> Result<()> {
-    let (_tmp, graph, repo, mut _meta, _description) =
+    let (_tmp, ws, repo, mut _meta, _description) =
         writable_scenario("reword-three-commits", |_| {})?;
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -103,8 +107,12 @@ aac5238
     );
 
     // Move three.txt from commit three to commit two
-    let mut ws = graph.into_workspace()?;
-    let editor = Editor::create(&mut ws, &mut _meta, &repo)?;
+    let editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut _meta,
+        &repo,
+    )?;
     let outcome = move_changes_between_commits(
         editor,
         three_id,
@@ -175,7 +183,7 @@ e0495e9
 
 #[test]
 fn move_file_from_parent_to_head() -> Result<()> {
-    let (_tmp, graph, repo, mut _meta, _description) =
+    let (_tmp, ws, repo, mut _meta, _description) =
         writable_scenario("reword-three-commits", |_| {})?;
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -191,8 +199,12 @@ fn move_file_from_parent_to_head() -> Result<()> {
     let two_id = repo.rev_parse_single("two")?.detach();
 
     // Move two.txt from commit two up to commit three
-    let mut ws = graph.into_workspace()?;
-    let editor = Editor::create(&mut ws, &mut _meta, &repo)?;
+    let editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut _meta,
+        &repo,
+    )?;
     let outcome = move_changes_between_commits(
         editor,
         two_id,
@@ -261,7 +273,7 @@ e0495e9
 
 #[test]
 fn move_file_between_non_adjacent_commits() -> Result<()> {
-    let (_tmp, graph, repo, mut _meta, _description) =
+    let (_tmp, ws, repo, mut _meta, _description) =
         writable_scenario("reword-three-commits", |_| {})?;
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -277,8 +289,12 @@ fn move_file_between_non_adjacent_commits() -> Result<()> {
     let one_id = repo.rev_parse_single("one")?.detach();
 
     // Move three.txt from commit three to commit one (skipping two)
-    let mut ws = graph.into_workspace()?;
-    let editor = Editor::create(&mut ws, &mut _meta, &repo)?;
+    let editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut _meta,
+        &repo,
+    )?;
     let outcome = move_changes_between_commits(
         editor,
         three_id,
@@ -364,15 +380,19 @@ e0495e9
 
 #[test]
 fn error_when_changes_not_found_in_source() -> Result<()> {
-    let (_tmp, graph, repo, mut _meta, _description) =
+    let (_tmp, ws, repo, mut _meta, _description) =
         writable_scenario("reword-three-commits", |_| {})?;
 
     let three_id = repo.rev_parse_single("three")?.detach();
     let two_id = repo.rev_parse_single("two")?.detach();
 
     // Try to move a file that doesn't exist in source commit
-    let mut ws = graph.into_workspace()?;
-    let editor = Editor::create(&mut ws, &mut _meta, &repo)?;
+    let editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut _meta,
+        &repo,
+    )?;
     let result = move_changes_between_commits(
         editor,
         three_id,

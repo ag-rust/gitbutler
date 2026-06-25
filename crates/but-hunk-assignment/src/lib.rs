@@ -897,7 +897,7 @@ mod tests {
     use bstr::BString;
     use but_core::{HunkHeader, ref_metadata::StackId};
     use but_graph::{
-        SegmentIndex, Workspace,
+        Workspace,
         workspace::{Stack, StackSegment, WorkspaceKind},
     };
 
@@ -992,11 +992,11 @@ mod tests {
             remote_tracking_ref_name: None,
             sibling_segment_id: None,
             remote_tracking_branch_segment_id: None,
-            id: SegmentIndex::new(id),
+            name_projected_from_outside: false,
+            id,
             commits: vec![],
             commits_outside: None,
             base: None,
-            base_segment_id: None,
             commits_by_segment: vec![],
             commits_on_remote: vec![],
             metadata: None,

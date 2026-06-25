@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use but_core::ref_metadata::StackId;
-use but_graph::{Graph, SegmentIndex, SegmentMetadata, workspace::StackCommitDebugFlags};
+use but_graph::{Graph, SegmentMetadata, workspace::StackCommitDebugFlags};
 use termtree::Tree;
 
 type StringTree = Tree<String>;
@@ -20,7 +20,7 @@ fn graph_workspace_inner(
     workspace: &but_graph::Workspace,
     mut stack_id_map: Option<BTreeMap<StackId, StackId>>,
 ) -> StringTree {
-    let commit_flags = if workspace.graph.hard_limit_hit() {
+    let commit_flags = if workspace.hard_limit_hit() {
         StackCommitDebugFlags::HardLimitReached
     } else {
         Default::default()
@@ -76,13 +76,55 @@ fn tree_for_stack_segment(
     root
 }
 
+/// Longest path from a root (a segment with no incoming connection); roots are generation 0.
+/// Derived at render time from the graph's connections — the render's `[N]` markers do not
+/// depend on any stored value.
+fn generations(graph: &Graph) -> BTreeMap<usize, usize> {
+    let all: Vec<usize> = graph.segment_ids().collect();
+    let mut indegree = BTreeMap::<usize, usize>::new();
+    for &sidx in &all {
+        indegree.entry(sidx).or_insert(0);
+        for conn in &graph[sidx].connections {
+            *indegree.entry(conn.target).or_insert(0) += 1;
+        }
+    }
+    let mut depth = BTreeMap::<usize, usize>::new();
+    let mut queue: std::collections::VecDeque<usize> = indegree
+        .iter()
+        .filter_map(|(&sidx, &n)| (n == 0).then_some(sidx))
+        .collect();
+    for &sidx in &all {
+        depth.insert(sidx, 0);
+    }
+    while let Some(sidx) = queue.pop_front() {
+        let g = depth[&sidx];
+        for conn in &graph[sidx].connections {
+            let e = depth.entry(conn.target).or_insert(0);
+            *e = (*e).max(g + 1);
+            let d = indegree.get_mut(&conn.target).expect("all indexed");
+            *d -= 1;
+            if *d == 0 {
+                queue.push_back(conn.target);
+            }
+        }
+    }
+    depth
+}
+
 /// Visualize `graph` as a tree.
 pub fn graph_tree(graph: &Graph) -> StringTree {
     let mut root = Tree::new("".to_string());
     let mut seen = Default::default();
     let max_goals = graph.max_goals();
+    let generations = generations(graph);
     for sidx in graph.tip_segments() {
-        root.push(recurse_segment(graph, sidx, &mut seen, max_goals));
+        root.push(recurse_segment(
+            graph,
+            sidx,
+            &mut seen,
+            max_goals,
+            &generations,
+        ));
     }
     let missing = graph.num_segments() - seen.len();
     if missing > 0 {
@@ -90,8 +132,14 @@ pub fn graph_tree(graph: &Graph) -> StringTree {
             "ERROR: disconnected {missing} nodes unreachable through base"
         ));
         let mut newly_seen = Default::default();
-        for sidx in graph.segments().filter(|sidx| !seen.contains(sidx)) {
-            missing.push(recurse_segment(graph, sidx, &mut newly_seen, max_goals));
+        for sidx in graph.segment_ids().filter(|sidx| !seen.contains(sidx)) {
+            missing.push(recurse_segment(
+                graph,
+                sidx,
+                &mut newly_seen,
+                max_goals,
+                &generations,
+            ));
         }
         root.push(missing);
         seen.extend(newly_seen);
@@ -124,15 +172,16 @@ fn tree_for_commit(
 }
 fn recurse_segment(
     graph: &but_graph::Graph,
-    sidx: SegmentIndex,
-    seen: &mut BTreeSet<SegmentIndex>,
+    sidx: usize,
+    seen: &mut BTreeSet<usize>,
     max_goals: Option<usize>,
+    generations: &BTreeMap<usize, usize>,
 ) -> StringTree {
     let segment = &graph[sidx];
     if seen.contains(&sidx) {
         return format!(
             "→:{sidx}:{name}",
-            sidx = sidx.index(),
+            sidx = sidx,
             name = graph[sidx]
                 .ref_info
                 .as_ref()
@@ -145,19 +194,21 @@ fn recurse_segment(
                     maybe_sibling = segment
                         .remote_tracking_branch_segment_id
                         .or(segment.sibling_segment_id)
-                        .map_or_else(String::new, |sid| format!(" →:{}:", sid.index()))
+                        .map_or_else(String::new, |sid| format!(" →:{sid}:"))
                 ))
                 .unwrap_or_default()
         )
         .into();
     }
     seen.insert(sidx);
-    let ep = graph.entrypoint().unwrap();
-    let segment_is_entrypoint = ep.segment.id == sidx;
-    let entrypoint_commit = ep.commit();
+    let (ep_sidx, ep_commit_id) = graph
+        .entrypoint_segment_and_commit_id()
+        .expect("BUG: must always set the entrypoint");
+    let segment_is_entrypoint = ep_sidx == sidx;
+    let ep_segment = &graph[ep_sidx];
     let mut entrypoint_commit_index =
-        entrypoint_commit.and_then(|commit| ep.segment.commit_index_of(commit.id));
-    if ep.segment.ref_info.is_some() && entrypoint_commit_index == Some(0) {
+        ep_commit_id.and_then(|id| ep_segment.commits.iter().position(|c| c.id == id));
+    if ep_segment.ref_info.is_some() && entrypoint_commit_index == Some(0) {
         entrypoint_commit_index = None;
     }
     let mut show_segment_entrypoint = segment_is_entrypoint;
@@ -167,11 +218,19 @@ fn recurse_segment(
             show_segment_entrypoint = false;
         }
     }
+    // Only edges landing on the target's first commit count as "below", grouped by the
+    // source commit they leave from — everything read off the edge payload.
     let connected_segments = {
         let mut m = BTreeMap::<_, Vec<_>>::new();
-        let below = graph.segments_below_in_order(sidx).collect::<Vec<_>>();
-        for (source_cidx, sidx) in below {
-            m.entry(source_cidx).or_default().push(sidx);
+        for connection in &segment.connections {
+            let target_first_commit = graph[connection.target].commits.first().map(|c| c.id);
+            if connection.dst_id().is_some() && connection.dst_id() != target_first_commit {
+                continue;
+            }
+            let source_cidx = connection
+                .src_id()
+                .and_then(|id| segment.commits.iter().position(|c| c.id == id));
+            m.entry(source_cidx).or_default().push(connection.target);
         }
         m
     };
@@ -189,15 +248,15 @@ fn recurse_segment(
                 "📙"
             }
         },
-        id = segment.id.index(),
-        generation = segment.generation,
-        arrow = if segment.workspace_metadata().is_some() {
+        id = segment.id,
+        generation = generations.get(&sidx).copied().unwrap_or_default(),
+        arrow = if matches!(segment.metadata, Some(SegmentMetadata::Workspace(_))) {
             "►►►"
         } else {
             "►"
         },
         entrypoint = if show_segment_entrypoint {
-            if entrypoint_commit.is_none() && entrypoint_commit_index.is_some() {
+            if ep_commit_id.is_none() && entrypoint_commit_index.is_some() {
                 "🫱"
             } else {
                 "👉"
@@ -227,7 +286,7 @@ fn recurse_segment(
         );
         if let Some(segment_indices) = connected_segments.get(&Some(cidx)) {
             for sidx in segment_indices {
-                commit_tree.push(recurse_segment(graph, *sidx, seen, max_goals));
+                commit_tree.push(recurse_segment(graph, *sidx, seen, max_goals, generations));
             }
         }
         root.push(commit_tree);
@@ -235,7 +294,7 @@ fn recurse_segment(
     // Get the segments that are directly connected.
     if let Some(segment_indices) = connected_segments.get(&None) {
         for sidx in segment_indices {
-            root.push(recurse_segment(graph, *sidx, seen, max_goals));
+            root.push(recurse_segment(graph, *sidx, seen, max_goals, generations));
         }
     }
 

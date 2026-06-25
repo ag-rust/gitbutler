@@ -4,7 +4,7 @@ use std::io::{self, Write as _};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use but_graph::FirstParent;
-use but_graph::init::Tip;
+use but_graph::walk::Seed;
 use gix::{odb::store::RefreshMode, reference::Category, revision::plumbing::Spec};
 
 use crate::{
@@ -146,7 +146,7 @@ fn merge_base(
     Ok(())
 }
 
-fn args_to_tips(repo: &gix::Repository, graph_args: &RevisionGraphArgs) -> Result<Vec<Tip>> {
+fn args_to_tips(repo: &gix::Repository, graph_args: &RevisionGraphArgs) -> Result<Vec<Seed>> {
     let mut tips = Vec::new();
 
     if let Some(tip) = graph_args
@@ -162,7 +162,7 @@ fn args_to_tips(repo: &gix::Repository, graph_args: &RevisionGraphArgs) -> Resul
                 "Target ref '{name}' resolved from '{target_ref}' is not a remote-tracking branch; use --extra-target for arbitrary revisions"
             );
             let id = reference.peel_to_id()?.detach();
-            Ok(Tip::integrated(id, Some(name)))
+            Ok(Seed::integrated(id, Some(name)))
         })
         .transpose()?
     {
@@ -174,7 +174,7 @@ fn args_to_tips(repo: &gix::Repository, graph_args: &RevisionGraphArgs) -> Resul
         .as_deref()
         .map(|rev| {
             repo.rev_parse_single(rev)
-                .map(|id| Tip::integrated(id.detach(), None))
+                .map(|id| Seed::integrated(id.detach(), None))
                 .with_context(|| format!("Failed to resolve extra target '{rev}'"))
         })
         .transpose()?
@@ -189,27 +189,27 @@ fn graph_for_revisions(
     repo: &gix::Repository,
     meta: &EmptyRefMetadata,
     commits: &[gix::ObjectId],
-    graph_tips: Vec<Tip>,
+    graph_tips: Vec<Seed>,
 ) -> Result<but_graph::Graph> {
     let first = *commits
         .first()
         .context("BUG: revision graph requires at least one commit")?;
-    let options = but_graph::init::Options {
+    let options = but_graph::walk::Options {
         collect_tags: false,
         commits_limit_hint: None,
         ..Default::default()
     };
-    let tips = std::iter::once(Tip::entrypoint(first, None))
+    let tips = std::iter::once(Seed::entrypoint(first, None))
         .chain(
             commits
                 .iter()
                 .copied()
                 .skip(1)
-                .map(|id| Tip::reachable(id, None)),
+                .map(|id| Seed::reachable(id, None)),
         )
         .chain(graph_tips);
 
-    but_graph::Graph::from_commit_traversal_tips(
+    but_graph::Graph::from_seeds(
         repo,
         tips,
         meta,

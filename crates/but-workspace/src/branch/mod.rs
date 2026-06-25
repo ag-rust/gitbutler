@@ -91,7 +91,7 @@
 //! Alternatively, auto-resolves could be deactivated if we are in Git mode, and instead they are applied
 //! to the worktree directly, and we wait (with sequencer support) until the conflict has been resolved.
 //!
-//! ## Workspace Tip
+//! ## Workspace Seed
 //!
 //! This is the elaborate name of the commit that currently represents what's visible in the working tree,
 //! i.e. the commit that `HEAD` points to.
@@ -486,14 +486,14 @@ impl OnWorkspaceMergeConflict {
 /// and `tip` is the commit/segment pair to merge, with no ref name attached.
 pub(crate) fn anon_stacks(
     stacks: &[but_graph::workspace::Stack],
-) -> impl Iterator<Item = (usize, crate::commit::merge::Tip)> {
+) -> impl Iterator<Item = (usize, crate::commit::merge::Seed)> {
     stacks.iter().enumerate().filter_map(|(idx, s)| {
         if s.ref_name().is_none() {
             s.tip_skip_empty().and_then(|cid| {
                 s.segments.first().map(|s| {
                     (
                         idx,
-                        crate::commit::merge::Tip {
+                        crate::commit::merge::Seed {
                             name: None,
                             commit_id: cid,
                             segment_idx: s.id,

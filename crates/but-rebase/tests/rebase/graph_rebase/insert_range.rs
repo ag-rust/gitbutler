@@ -1,10 +1,10 @@
 //! These tests exercise the insert segment operation.
 use anyhow::{Context, Result};
 use bstr::ByteSlice;
-use but_graph::Graph;
+use but_graph::Workspace;
 use but_rebase::graph_rebase::{Editor, mutate};
 use but_testsupport::{git_status, graph_tree, visualize_commit_graph, visualize_commit_graph_all};
-use snapbox::IntoData;
+use snapbox::prelude::*;
 
 use crate::utils::{fixture_writable, standard_options};
 
@@ -49,15 +49,19 @@ fn insert_single_node_segment_above() -> Result<()> {
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let a = repo.rev_parse_single("A")?.detach();
     let a_selector = editor
@@ -68,39 +72,45 @@ fn insert_single_node_segment_above() -> Result<()> {
         .select_reference(b)
         .context("Failed to find reference b in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: a_selector,
         parent: a_selector,
     };
 
-    editor.insert_segment(b_selector, delimiter, mutate::InsertSide::Above)?;
+    editor.insert_range(b_selector, range, mutate::InsertSide::Above)?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:main[🌳]
-    └── ·ee7f107 (⌂|1)
+    └── ·ee7f107 (⌂)
         ├── ►:1[1]:A
-        │   └── ·69221b4 (⌂|1)
+        │   └── ·69221b4 (⌂)
         │       ├── ►:3[2]:B
-        │       │   ├── ·a748762 (⌂|1)
-        │       │   └── ·62e05ba (⌂|1)
+        │       │   ├── ·a748762 (⌂)
+        │       │   └── ·62e05ba (⌂)
         │       │       └── ►:4[3]:anon:
-        │       │           └── 🏁·8f0d338 (⌂|1) ►tags/base
+        │       │           └── 🏁·8f0d338 (⌂) ►tags/base
         │       └── →:4:
         └── ►:2[1]:C
-            ├── ·930563a (⌂|1)
-            ├── ·68a2fc3 (⌂|1)
-            └── ·984fd1c (⌂|1)
+            ├── ·930563a (⌂)
+            ├── ·68a2fc3 (⌂)
+            └── ·984fd1c (⌂)
                 └── →:4:
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -147,15 +157,19 @@ fn insert_single_node_segment_below() -> Result<()> {
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let a = repo.rev_parse_single("A")?.detach();
     let a_selector = editor
@@ -166,41 +180,47 @@ fn insert_single_node_segment_below() -> Result<()> {
         .select_commit(b)
         .context("Failed to find commit b in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: a_selector,
         parent: a_selector,
     };
 
-    editor.insert_segment(b_selector, delimiter, mutate::InsertSide::Below)?;
+    editor.insert_range(b_selector, range, mutate::InsertSide::Below)?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:main[🌳]
-    └── ·b005f3c (⌂|1)
-        ├── ►:1[2]:A
-        │   └── ·7f0cc55 (⌂|1)
+    └── ·b005f3c (⌂)
+        ├── ►:3[2]:A
+        │   └── ·7f0cc55 (⌂)
         │       ├── ►:4[3]:anon:
-        │       │   └── ·62e05ba (⌂|1)
+        │       │   └── ·62e05ba (⌂)
         │       │       └── ►:5[4]:anon:
-        │       │           └── 🏁·8f0d338 (⌂|1) ►tags/base
+        │       │           └── 🏁·8f0d338 (⌂) ►tags/base
         │       └── →:5:
         ├── ►:2[1]:B
-        │   └── ·a3301fe (⌂|1)
-        │       └── →:1: (A)
-        └── ►:3[1]:C
-            ├── ·930563a (⌂|1)
-            ├── ·68a2fc3 (⌂|1)
-            └── ·984fd1c (⌂|1)
+        │   └── ·a3301fe (⌂)
+        │       └── →:3: (A)
+        └── ►:1[1]:C
+            ├── ·930563a (⌂)
+            ├── ·68a2fc3 (⌂)
+            └── ·984fd1c (⌂)
                 └── →:5:
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -248,15 +268,19 @@ fn insert_multi_node_segment_above() -> Result<()> {
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let a = repo.rev_parse_single("A")?.detach();
     let a_selector = editor
@@ -271,40 +295,46 @@ fn insert_multi_node_segment_above() -> Result<()> {
         .select_commit(b_parent)
         .context("Failed to find parent of commit b in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: b_selector,
         parent: b_parent_selector,
     };
 
-    editor.insert_segment(a_selector, delimiter, mutate::InsertSide::Above)?;
+    editor.insert_range(a_selector, range, mutate::InsertSide::Above)?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:main[🌳]
-    └── ·61b2679 (⌂|1)
+    └── ·61b2679 (⌂)
         ├── ►:1[1]:anon:
-        │   └── ·758c8a3 (⌂|1) ►A, ►B
+        │   └── ·758c8a3 (⌂) ►A, ►B
         │       └── ►:3[2]:anon:
-        │           └── ·db40ffc (⌂|1)
+        │           └── ·db40ffc (⌂)
         │               ├── ►:4[3]:anon:
-        │               │   └── ·add59d2 (⌂|1)
+        │               │   └── ·add59d2 (⌂)
         │               │       └── ►:5[4]:anon:
-        │               │           └── 🏁·8f0d338 (⌂|1) ►tags/base
+        │               │           └── 🏁·8f0d338 (⌂) ►tags/base
         │               └── →:5:
         └── ►:2[1]:C
-            ├── ·930563a (⌂|1)
-            ├── ·68a2fc3 (⌂|1)
-            └── ·984fd1c (⌂|1)
+            ├── ·930563a (⌂)
+            ├── ·68a2fc3 (⌂)
+            └── ·984fd1c (⌂)
                 └── →:5:
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -352,15 +382,19 @@ fn insert_multi_node_segment_below() -> Result<()> {
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let a = repo.rev_parse_single("A")?.detach();
     let a_selector = editor
@@ -375,39 +409,45 @@ fn insert_multi_node_segment_below() -> Result<()> {
         .select_commit(b_parent)
         .context("Failed to find parent of commit b in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: b_selector,
         parent: b_parent_selector,
     };
 
-    editor.insert_segment(a_selector, delimiter, mutate::InsertSide::Below)?;
+    editor.insert_range(a_selector, range, mutate::InsertSide::Below)?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:main[🌳]
-    └── ·4db28a9 (⌂|1)
+    └── ·4db28a9 (⌂)
         ├── ►:1[1]:A
-        │   └── ·71dfc8f (⌂|1)
-        │       └── ►:2[2]:B
-        │           ├── ·a748762 (⌂|1)
-        │           └── ·62e05ba (⌂|1)
+        │   └── ·71dfc8f (⌂)
+        │       └── ►:3[2]:B
+        │           ├── ·a748762 (⌂)
+        │           └── ·62e05ba (⌂)
         │               └── ►:4[3]:anon:
-        │                   └── 🏁·8f0d338 (⌂|1) ►tags/base
-        ├── →:2: (B)
-        └── ►:3[1]:C
-            ├── ·930563a (⌂|1)
-            ├── ·68a2fc3 (⌂|1)
-            └── ·984fd1c (⌂|1)
+        │                   └── 🏁·8f0d338 (⌂) ►tags/base
+        ├── →:3: (B)
+        └── ►:2[1]:C
+            ├── ·930563a (⌂)
+            ├── ·68a2fc3 (⌂)
+            └── ·984fd1c (⌂)
                 └── →:4:
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -455,15 +495,19 @@ fn insert_single_node_segment_above_with_explicit_children() -> Result<()> {
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let a = repo.rev_parse_single("A")?.detach();
     let a_selector = editor
@@ -478,48 +522,54 @@ fn insert_single_node_segment_above_with_explicit_children() -> Result<()> {
         .select_commit(c)
         .context("Failed to find commit c in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: a_selector,
         parent: a_selector,
     };
 
-    editor.insert_segment_into(
+    editor.insert_range_into(
         b_selector,
-        delimiter,
+        range,
         mutate::InsertSide::Above,
         Some(mutate::SomeSelectors::new(vec![c_selector])?),
         mutate::ParentReparentingOrder::Prepend,
     )?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:main[🌳]
-    └── ·cca953f (⌂|1)
-        ├── ►:1[2]:A
-        │   └── ·69221b4 (⌂|1)
-        │       ├── ►:2[3]:B
-        │       │   ├── ·a748762 (⌂|1)
-        │       │   └── ·62e05ba (⌂|1)
-        │       │       └── ►:4[4]:anon:
-        │       │           └── 🏁·8f0d338 (⌂|1) ►tags/base
-        │       └── →:4:
-        ├── →:2: (B)
-        └── ►:3[1]:C
-            └── ·76e2160 (⌂|1)
-                ├── ►:5[2]:anon:
-                │   ├── ·68a2fc3 (⌂|1)
-                │   └── ·984fd1c (⌂|1)
-                │       └── →:4:
-                └── →:1: (A)
+    └── ·cca953f (⌂)
+        ├── ►:2[2]:A
+        │   └── ·69221b4 (⌂)
+        │       ├── ►:4[3]:B
+        │       │   ├── ·a748762 (⌂)
+        │       │   └── ·62e05ba (⌂)
+        │       │       └── ►:5[4]:anon:
+        │       │           └── 🏁·8f0d338 (⌂) ►tags/base
+        │       └── →:5:
+        ├── →:4: (B)
+        └── ►:1[1]:C
+            └── ·76e2160 (⌂)
+                ├── ►:3[2]:anon:
+                │   ├── ·68a2fc3 (⌂)
+                │   └── ·984fd1c (⌂)
+                │       └── →:5:
+                └── →:2: (A)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
 
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -573,15 +623,19 @@ fn insert_single_node_segment_below_with_explicit_parents() -> Result<()> {
     );
     snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
 
-    let graph = Graph::from_head(
+    let mut ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let a = repo.rev_parse_single("A")?.detach();
     let a_selector = editor
@@ -596,48 +650,54 @@ fn insert_single_node_segment_below_with_explicit_parents() -> Result<()> {
         .select_commit(c)
         .context("Failed to find commit c in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: b_selector,
         parent: b_selector,
     };
 
-    editor.insert_segment_into(
+    editor.insert_range_into(
         a_selector,
-        delimiter,
+        range,
         mutate::InsertSide::Below,
         Some(mutate::SomeSelectors::new(vec![c_selector])?),
         mutate::ParentReparentingOrder::Prepend,
     )?;
 
     let outcome = editor.rebase()?;
-    let overlayed = graph_tree(&outcome.overlayed_graph()?).to_string();
+    let overlayed = graph_tree(&ws.graph.redo_traversal(
+        outcome.repo(),
+        outcome.meta(),
+        outcome.rebase_overlay()?,
+    )?)
+    .to_string();
     snapbox::assert_data_eq!(
-        &overlayed,
+        overlayed.as_str(),
         snapbox::str![[r#"
 
 └── 👉►:0[0]:main[🌳]
-    └── ·54f9cab (⌂|1)
+    └── ·54f9cab (⌂)
         ├── ►:1[1]:A
-        │   └── ·9501727 (⌂|1)
-        │       ├── ►:4[4]:anon:
-        │       │   └── 🏁·8f0d338 (⌂|1) ►tags/base
+        │   └── ·9501727 (⌂)
+        │       ├── ►:5[4]:anon:
+        │       │   └── 🏁·8f0d338 (⌂) ►tags/base
         │       └── ►:2[2]:B
-        │           └── ·347772f (⌂|1)
+        │           └── ·347772f (⌂)
         │               ├── ►:3[3]:C
-        │               │   ├── ·930563a (⌂|1)
-        │               │   ├── ·68a2fc3 (⌂|1)
-        │               │   └── ·984fd1c (⌂|1)
-        │               │       └── →:4:
-        │               └── ►:5[3]:anon:
-        │                   └── ·62e05ba (⌂|1)
-        │                       └── →:4:
+        │               │   ├── ·930563a (⌂)
+        │               │   ├── ·68a2fc3 (⌂)
+        │               │   └── ·984fd1c (⌂)
+        │               │       └── →:5:
+        │               └── ►:4[3]:anon:
+        │                   └── ·62e05ba (⌂)
+        │                       └── →:5:
         ├── →:2: (B)
         └── →:3: (C)
 
 "#]]
     );
     let outcome = outcome.materialize()?;
-    assert_eq!(overlayed, graph_tree(&outcome.workspace.graph).to_string());
+    ws.refresh_from_commit_graph(outcome.arena().clone(), &repo, outcome.meta)?;
+    assert_eq!(overlayed, graph_tree(&ws.graph).to_string());
     assert_eq!(
         parent_subjects(&repo, "B")?,
         [
@@ -677,15 +737,19 @@ fn insert_single_node_segment_below_with_explicit_parents() -> Result<()> {
 #[test]
 fn insert_single_node_segment_below_can_append_reparented_parent() -> Result<()> {
     let (repo, _tmp, mut meta) = fixture_writable("three-branches-merged")?;
-    let graph = Graph::from_head(
+    let ws = Workspace::from_head(
         &repo,
         &*meta,
         but_core::ref_metadata::ProjectMeta::default(),
         standard_options(),
     )?
     .validated()?;
-    let mut ws = graph.into_workspace()?;
-    let mut editor = Editor::create(&mut ws, &mut *meta, &repo)?;
+    let mut editor = Editor::create(
+        ws.graph.commit_graph(),
+        &ws.graph.project_meta,
+        &mut *meta,
+        &repo,
+    )?;
 
     let a = repo.rev_parse_single("A")?.detach();
     let a_selector = editor
@@ -700,14 +764,14 @@ fn insert_single_node_segment_below_can_append_reparented_parent() -> Result<()>
         .select_commit(c)
         .context("Failed to find commit c in editor graph")?;
 
-    let delimiter = mutate::SegmentDelimiter {
+    let range = mutate::StepRange {
         child: b_selector,
         parent: b_selector,
     };
 
-    editor.insert_segment_into(
+    editor.insert_range_into(
         a_selector,
-        delimiter,
+        range,
         mutate::InsertSide::Below,
         Some(mutate::SomeSelectors::new(vec![c_selector])?),
         mutate::ParentReparentingOrder::Append,
