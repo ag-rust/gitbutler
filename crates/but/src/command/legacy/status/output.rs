@@ -268,6 +268,7 @@ pub(super) enum StatusOutputContent {
 
 #[derive(Debug, Default, Clone)]
 pub(super) struct CommitLineContent {
+    pub(super) change_id: Vec<Span<'static>>,
     pub(super) sha: Vec<Span<'static>>,
     pub(super) author: Vec<Span<'static>>,
     pub(super) message: Vec<Span<'static>>,

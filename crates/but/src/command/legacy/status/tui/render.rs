@@ -580,10 +580,13 @@ fn render_status_list_item(
             }
             StatusOutputContent::Commit(CommitLineContent {
                 sha,
+                change_id,
                 author,
                 message,
                 suffix,
             }) => {
+                line.extend(change_id.iter().cloned());
+
                 if line_has_copied_highlight {
                     line.extend(sha.iter().cloned().map(with_highlight));
                 } else if let Mode::Jump(jump_mode) = &*app.mode {

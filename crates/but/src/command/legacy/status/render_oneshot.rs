@@ -32,10 +32,12 @@ pub(super) fn render_oneshot(
         }
         StatusOutputContent::Commit(CommitLineContent {
             mut sha,
+            mut change_id,
             mut author,
             mut message,
             mut suffix,
         }) => {
+            spans.append(&mut change_id);
             spans.append(&mut sha);
             spans.append(&mut author);
             spans.append(&mut message);
