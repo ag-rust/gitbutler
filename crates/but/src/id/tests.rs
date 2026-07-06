@@ -47,7 +47,7 @@ fn uint_id_to_short_id() {
 fn commit_id_works_with_two_or_more_characters() -> anyhow::Result<()> {
     let id1 = id(1);
     let stacks = vec![stack([segment("not-important", [id1], None, [])])];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     insta::assert_debug_snapshot!(id_map.debug_state(), @"
     workspace_and_remote_commits_count: 1
     branches: [ no ]
@@ -82,7 +82,7 @@ fn commit_id_appearing_multiple_times() -> anyhow::Result<()> {
         stack([segment("branch1", [id(2), id1], None, [])]),
         stack([segment("branch2", [id(3), id1], None, [])]),
     ];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -108,7 +108,7 @@ fn commit_ids_become_longer_if_ambiguous() -> anyhow::Result<()> {
     let id2 = hex_to_id("21bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     let id3 = hex_to_id("21bccccccccccccccccccccccccccccccccccccc");
     let stacks = vec![stack([segment("not-important", [id1, id2, id3], None, [])])];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     insta::assert_debug_snapshot!(id_map.debug_state(), @"
     workspace_and_remote_commits_count: 3
     branches: [ no ]
@@ -153,7 +153,7 @@ fn commit_ids_become_longer_if_ambiguous() -> anyhow::Result<()> {
 #[test]
 fn branches_work_with_single_character() -> anyhow::Result<()> {
     let stacks = vec![stack([segment("f", [id(1)], None, [])])];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -191,7 +191,7 @@ fn branches_match_by_substring() -> anyhow::Result<()> {
         segment("baz", [id(4)], None, []),
     ])];
 
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -236,7 +236,7 @@ fn branches_match_by_substring() -> anyhow::Result<()> {
 #[test]
 fn branches_avoid_uncommitted_area_id() -> anyhow::Result<()> {
     let stacks = vec![stack([segment("zza", [id(1)], None, [])])];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -266,7 +266,7 @@ fn branches_avoid_invalid_ids() -> anyhow::Result<()> {
         segment("x-yz_/hi", [id(1)], None, []),
         segment("0ax", [id(2)], None, []),
     ])];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     insta::assert_debug_snapshot!(id_map.debug_state(), @"
     workspace_and_remote_commits_count: 2
     branches: [ ax, yz ]
@@ -304,7 +304,7 @@ fn branches_avoid_invalid_ids() -> anyhow::Result<()> {
 fn branches_avoid_uncommitted_filenames() -> anyhow::Result<()> {
     let stacks = vec![stack([segment("ghij", [id(1)], None, [])])];
     let hunk_assignments = vec![hunk_assignment("gh", None), hunk_assignment("hi", None)];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -336,7 +336,7 @@ fn branch_cannot_generate_id() -> anyhow::Result<()> {
         stack([segment("substring", [id(1)], None, [])]),
         stack([segment("supersubstring", [id(2)], None, [])]),
     ];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -387,7 +387,7 @@ fn non_commit_ids_do_not_collide() -> anyhow::Result<()> {
         },
         hunk_assignment("uncommitted2.txt", None),
     ];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     insta::assert_debug_snapshot!(id_map.debug_state(), @"
     workspace_and_remote_commits_count: 1
     branches: [ h0 ]
@@ -542,7 +542,7 @@ fn non_commit_ids_do_not_collide() -> anyhow::Result<()> {
 fn ids_are_case_sensitive() -> anyhow::Result<()> {
     let stacks = vec![stack([segment("h0", [id(10)], Some(id(9)), [])])];
     let hunk_assignments = vec![hunk_assignment("uncommitted.txt", None)];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -643,7 +643,7 @@ fn uncommitted_files_disambiguate_between_themselves() -> anyhow::Result<()> {
         hunk_assignment("foo23", None),
         hunk_assignment("foo242", None),
     ];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -756,7 +756,7 @@ fn uncommitted_files_disambiguate_between_themselves() -> anyhow::Result<()> {
 fn uncommitted_files_disambiguate_with_branch() -> anyhow::Result<()> {
     let stacks = vec![stack([segment("fookpfoo", [id(1)], None, [])])];
     let hunk_assignments = vec![hunk_assignment("foo23", None)];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -811,7 +811,7 @@ fn uncommitted_files_disambiguate_with_branch() -> anyhow::Result<()> {
 fn longer_id_is_ok() -> anyhow::Result<()> {
     let stacks = vec![stack([segment("foo", [id(1)], None, [])])];
     let hunk_assignments = vec![hunk_assignment("foo23", None)];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -855,7 +855,7 @@ fn longer_id_is_ok() -> anyhow::Result<()> {
 fn reverse_hex_filename_is_its_own_id() -> anyhow::Result<()> {
     let stacks = vec![stack([segment("foo", [id(1)], None, [])])];
     let hunk_assignments = vec![hunk_assignment("klmxyz", None)];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -899,7 +899,7 @@ fn reverse_hex_filename_is_its_own_id() -> anyhow::Result<()> {
 fn branch_and_file_by_name() -> anyhow::Result<()> {
     let stacks = vec![stack([segment("foo", [id(1)], None, [])])];
     let hunk_assignments = vec![hunk_assignment("foo", None)];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -956,7 +956,7 @@ fn colon_uncommitted_filename() -> anyhow::Result<()> {
         hunk_assignment("uncommitted", None),
         hunk_assignment("assigned", Some(StackId::from_number_for_testing(1))),
     ];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -1056,7 +1056,7 @@ fn uncommitted_path() -> anyhow::Result<()> {
         hunk_assignment("prefix/a", None),
         hunk_assignment("prefix/b", None),
     ];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -1113,7 +1113,7 @@ fn uncommitted_path() -> anyhow::Result<()> {
 #[test]
 fn committed_files_are_deduplicated_by_commit_oid_path() -> anyhow::Result<()> {
     let stacks = vec![stack([segment("branch", [id(2)], Some(id(1)), [])])];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
 
     // Simulate a changed_paths function that returns the same file twice
     // (which could happen due to a bug in the caller or data source)
@@ -1158,7 +1158,7 @@ fn short_uncommitted_files_are_properly_reverse_hexed() -> anyhow::Result<()> {
         hunk_assignment("kl", None),
         hunk_assignment("klm", None),
     ];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -1263,7 +1263,7 @@ fn uncommitted_hunks_by_numeric_index() -> anyhow::Result<()> {
         },
         hunk_assignment("uncommitted2.txt", None),
     ];
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -1393,7 +1393,7 @@ fn uncommitted_hunks_by_id() -> anyhow::Result<()> {
         hunk_assignment("hunk_without_diff.txt", None),
     ];
 
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -1543,7 +1543,7 @@ fn uncommitted_hunks_by_id_increase_id_length_as_necessary() -> anyhow::Result<(
         },
     ];
 
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -1636,7 +1636,7 @@ fn uncommitted_hunks_overspecifying_id_prefix() -> anyhow::Result<()> {
         ..hunk_assignment("uncommitted1.txt", None)
     }];
 
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -1706,7 +1706,7 @@ fn uncommitted_hunks_overspecifying_id_prefix_with_collision_disambiguation() ->
         },
     ];
 
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -1781,7 +1781,7 @@ fn underspecifying_hunk_ids() -> anyhow::Result<()> {
         },
     ];
 
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -1933,7 +1933,7 @@ fn uncommitted_hunks_by_id_collision_handling() -> anyhow::Result<()> {
         },
     ];
 
-    let id_map = IdMap::new(stacks, hunk_assignments)?;
+    let id_map = IdMap::new(stacks, hunk_assignments, gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -2010,7 +2010,7 @@ fn commit_matches_are_deduplicated_by_commit_oid() -> anyhow::Result<()> {
         Some(id(1)),
         [commit_id],
     )])];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -2034,7 +2034,7 @@ fn dedupe_does_not_hide_ambiguity_between_distinct_commits() -> anyhow::Result<(
     let id1 = hex_to_id("21aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let id2 = hex_to_id("21bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     let stacks = vec![stack([segment("branch", [id1, id2], None, [])])];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -2073,7 +2073,7 @@ fn dedupe_does_not_hide_ambiguity_between_branches_in_different_stacks() -> anyh
             ..stack([segment("foo", [id(2)], None, [])])
         },
     ];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {
@@ -2109,7 +2109,7 @@ fn dedupe_does_not_hide_ambiguity_between_unmanaged_branches_with_same_name() ->
         stack([segment("foo", [id(1)], None, [])]),
         stack([segment("foo", [id(2)], None, [])]),
     ];
-    let id_map = IdMap::new(stacks, Vec::new())?;
+    let id_map = IdMap::new(stacks, Vec::new(), gix::hashtable::HashMap::default())?;
     let changed_paths_fn = |commit_id: gix::ObjectId,
                             parent_id: Option<gix::ObjectId>|
      -> anyhow::Result<Vec<but_core::TreeChange>> {

@@ -5,7 +5,7 @@ use assignment::FileAssignment;
 use bstr::{BStr, BString, ByteSlice};
 use but_api::diff::ComputeLineStats;
 use but_core::{
-    RepositoryExt, TreeStatus,
+    ChangeId, RepositoryExt, TreeStatus,
     ref_metadata::StackId,
     sync::{RepoExclusive, RepoExclusiveGuard},
     ui,
@@ -348,6 +348,7 @@ fn build_status_context<'a>(
         remote_commits_by_id,
         stacks,
         resolved_target,
+        commit_id_to_change_id,
     ) = {
         let (repo, ws, _db) = ctx.workspace_and_db_with_perm(perm.read_permission())?;
         let head_info = but_workspace::graph_to_ref_info(
@@ -362,6 +363,8 @@ fn build_status_context<'a>(
         let mut push_statuses_by_segment_id = HashMap::<SegmentIndex, PushStatus>::new();
         let mut local_commits_by_id = HashMap::<gix::ObjectId, LocalCommit>::new();
         let mut remote_commits_by_id = HashMap::<gix::ObjectId, Commit>::new();
+        let mut commit_id_to_change_id =
+            gix::hashtable::HashMap::<gix::ObjectId, ChangeId>::default();
         for stack in head_info.stacks {
             for segment in stack.segments {
                 let Segment {
@@ -371,9 +374,15 @@ fn build_status_context<'a>(
                     ..
                 } = segment;
                 for local_commit in commits {
+                    if let Some(change_id) = &local_commit.inner.change_id {
+                        commit_id_to_change_id.insert(local_commit.id, change_id.clone());
+                    }
                     local_commits_by_id.insert(local_commit.id, local_commit);
                 }
                 for remote_commit in commits_on_remote {
+                    if let Some(change_id) = &remote_commit.change_id {
+                        commit_id_to_change_id.insert(remote_commit.id, change_id.clone());
+                    }
                     remote_commits_by_id.insert(remote_commit.id, remote_commit);
                 }
                 push_statuses_by_segment_id.insert(segment.id, push_status);
@@ -387,6 +396,7 @@ fn build_status_context<'a>(
             remote_commits_by_id,
             ws.stacks.clone(),
             resolved_target,
+            commit_id_to_change_id,
         )
     };
 
@@ -400,7 +410,11 @@ fn build_status_context<'a>(
     let worktree_changes =
         but_api::diff::changes_in_worktree_with_perm(ctx, perm.read_permission())?;
 
-    let id_map = IdMap::new(stacks, worktree_changes.assignments.clone())?;
+    let id_map = IdMap::new(
+        stacks,
+        worktree_changes.assignments.clone(),
+        commit_id_to_change_id,
+    )?;
 
     let stacks = id_map.stacks();
     // Store the count of stacks for hint logic later

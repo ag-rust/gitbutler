@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bstr::BString;
+use but_core::ChangeId;
 use but_graph::workspace::Stack;
 
 use crate::id::{
@@ -8,7 +9,10 @@ use crate::id::{
     id_usage::{IdUsage, UintId},
 };
 
-fn stacks_info_without_short_ids(stacks: Vec<Stack>) -> StacksInfo {
+fn stacks_info_without_short_ids(
+    stacks: Vec<Stack>,
+    commit_id_to_change_id: &gix::hashtable::HashMap<gix::ObjectId, ChangeId>,
+) -> StacksInfo {
     let mut stacks_info = StacksInfo {
         stacks: Vec::with_capacity(stacks.len()),
         id_usage: IdUsage::default(),
@@ -24,6 +28,7 @@ fn stacks_info_without_short_ids(stacks: Vec<Stack>) -> StacksInfo {
                 .into_iter()
                 .map(|commit| WorkspaceCommitWithId {
                     short_id: ShortId::default(),
+                    change_id: commit_id_to_change_id.get(&commit.id).cloned().map(Into::into),
                     inner: commit,
                 })
                 .collect::<Vec<_>>();
@@ -31,6 +36,7 @@ fn stacks_info_without_short_ids(stacks: Vec<Stack>) -> StacksInfo {
                 .into_iter()
                 .map(|commit| RemoteCommitWithId {
                     short_id: ShortId::default(),
+                    change_id: commit_id_to_change_id.get(&commit.id).cloned().map(Into::into),
                     inner: commit,
                 })
                 .collect::<Vec<_>>();
@@ -198,8 +204,9 @@ impl StacksInfo {
     pub(crate) fn new(
         stacks: Vec<Stack>,
         uncommitted_short_filenames: &HashSet<BString>,
+        commit_id_to_change_id: &gix::hashtable::HashMap<gix::ObjectId, ChangeId>,
     ) -> anyhow::Result<Self> {
-        let mut stacks_info = stacks_info_without_short_ids(stacks);
+        let mut stacks_info = stacks_info_without_short_ids(stacks, commit_id_to_change_id);
         populate_branch_short_ids(
             &mut stacks_info.stacks,
             &mut stacks_info.id_usage,

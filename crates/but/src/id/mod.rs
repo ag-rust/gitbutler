@@ -213,11 +213,37 @@ pub struct TreeChangeWithId {
     pub inner: but_core::TreeChange,
 }
 
+/// TODO
+#[derive(Debug, Clone)]
+pub struct ChangeIdWithShortId {
+    /// TODO
+    pub change_id: ChangeId,
+    /// TODO
+    pub short_id_len: usize,
+}
+
+impl ChangeIdWithShortId {
+    pub fn short_id(&self) -> ShortId {
+        self.change_id.chars().take(self.short_id_len).collect()
+    }
+}
+
+impl From<ChangeId> for ChangeIdWithShortId {
+    fn from(value: ChangeId) -> Self {
+        Self {
+            short_id_len: value.len(),
+            change_id: value,
+        }
+    }
+}
+
 /// A workspace commit with its short ID.
 #[derive(Debug, Clone)]
 pub struct WorkspaceCommitWithId {
     /// The short ID.
     pub short_id: ShortId,
+    /// The change ID
+    pub change_id: Option<ChangeIdWithShortId>,
     /// The original workspace commit.
     pub inner: StackCommit,
 }
@@ -311,6 +337,8 @@ impl<'a> Node<'a> for &'a WorkspaceCommitWithId {
 pub struct RemoteCommitWithId {
     /// The short ID.
     pub short_id: ShortId,
+    /// The change ID.
+    pub change_id: Option<ChangeIdWithShortId>,
     /// The original remote commit.
     pub inner: StackCommit,
 }
@@ -501,7 +529,11 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 impl IdMap {
     /// Initializes CLI IDs for branches, commits, and uncommitted
     /// files/hunks.
-    pub fn new(stacks: Vec<Stack>, hunk_assignments: Vec<HunkAssignment>) -> anyhow::Result<Self> {
+    pub fn new(
+        stacks: Vec<Stack>,
+        hunk_assignments: Vec<HunkAssignment>,
+        commit_id_to_change_id: gix::hashtable::HashMap<gix::ObjectId, ChangeId>,
+    ) -> anyhow::Result<Self> {
         let UncommittedInfo {
             partitioned_hunks,
             uncommitted_short_filenames,
@@ -510,7 +542,11 @@ impl IdMap {
             stacks,
             mut id_usage,
             short_ids_to_count,
-        } = StacksInfo::new(stacks, &uncommitted_short_filenames)?;
+        } = StacksInfo::new(
+            stacks,
+            &uncommitted_short_filenames,
+            &commit_id_to_change_id,
+        )?;
 
         let mut uncommitted_files: BTreeMap<ChangeId, UncommittedFile> = BTreeMap::new();
         for hunk_assignments in partitioned_hunks {
@@ -722,7 +758,30 @@ impl IdMap {
             }
         };
 
-        Self::new(ws.stacks.clone(), hunk_assignments)
+        let head_info = but_workspace::graph_to_ref_info(
+            &ws,
+            &repo,
+            but_workspace::ref_info::Options {
+                project_meta: ws.graph.project_meta.clone(),
+                ..Default::default()
+            },
+        )?;
+
+        let commit_id_to_change_id = head_info
+            .stacks
+            .into_iter()
+            .flat_map(|stack| stack.segments)
+            // TODO remote commits
+            .flat_map(|segment| segment.commits)
+            .filter_map(|commit| {
+                commit
+                    .inner
+                    .change_id
+                    .map(|change_id| (commit.inner.id, change_id))
+            })
+            .collect();
+
+        Self::new(ws.stacks.clone(), hunk_assignments, commit_id_to_change_id)
     }
 }
 
@@ -836,26 +895,47 @@ impl IdMap {
             }
         }
 
-        // Only try SHA matching if the input looks like a hex string
-        if element
+        // Match against commits
+        let maybe_hex_prefix = if element
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-            && let Ok(prefix) = gix::hash::Prefix::from_hex_nonempty(element)
         {
-            for stack_with_id in self.indexed_stacks.borrow_owner().iter() {
-                for segment_with_id in stack_with_id.segments.iter() {
-                    for workspace_commit_with_id in segment_with_id.workspace_commits.iter() {
-                        if prefix
-                            .cmp_oid(&workspace_commit_with_id.commit_id())
-                            .is_eq()
-                        {
-                            matches.push(Box::new(workspace_commit_with_id));
-                        }
+            gix::hash::Prefix::from_hex_nonempty(element).ok()
+        } else {
+            None
+        };
+        let matches_commit = |id: gix::ObjectId, maybe_change_id: Option<&ChangeId>| {
+            maybe_hex_prefix
+                .map(|hex_prefix| hex_prefix.cmp_oid(&id).is_eq())
+                .unwrap_or(false)
+                || maybe_change_id
+                    .map(|change_id| change_id.starts_with_str(element))
+                    .unwrap_or(false)
+        };
+
+        for stack_with_id in self.indexed_stacks.borrow_owner().iter() {
+            for segment_with_id in stack_with_id.segments.iter() {
+                for workspace_commit_with_id in segment_with_id.workspace_commits.iter() {
+                    if matches_commit(
+                        workspace_commit_with_id.commit_id(),
+                        workspace_commit_with_id
+                            .change_id
+                            .as_ref()
+                            .map(|cid| &cid.change_id),
+                    ) {
+                        matches.push(Box::new(workspace_commit_with_id))
                     }
-                    for remote_commit_with_id in segment_with_id.remote_commits.iter() {
-                        if prefix.cmp_oid(&remote_commit_with_id.commit_id()).is_eq() {
-                            matches.push(Box::new(remote_commit_with_id));
-                        }
+                }
+
+                for remote_commit_with_id in segment_with_id.remote_commits.iter() {
+                    if matches_commit(
+                        remote_commit_with_id.commit_id(),
+                        remote_commit_with_id
+                            .change_id
+                            .as_ref()
+                            .map(|cid| &cid.change_id),
+                    ) {
+                        matches.push(Box::new(remote_commit_with_id))
                     }
                 }
             }
